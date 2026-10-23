@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# 本地数据（含 API Key）
+.noelle/
+config.jsonc
+*.db
+*.log
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store

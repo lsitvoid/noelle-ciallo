@@ -1,0 +1,1222 @@
+"""命令行入口：参数解析与子命令分发。"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+from . import __version__, config as cfgmod, paths
+from .agent import Agent
+from .llm import LLMError, list_models
+from .storage import get_db
+from .tools import registry as tools
+from .ui.term import C, banner, err, out, prompt_input, stream_writer, table
+
+
+# ============================================================
+# init
+# ============================================================
+def cmd_init(args) -> int:
+    paths.ensure_dirs()
+    f = paths.config_file()
+    if f.is_file() and not args.force:
+        out(f"配置已存在：{f}")
+        out(f"用 --force 覆盖，或直接 noelle config 修改")
+        return 0
+    cfgmod.save(cfgmod.DEFAULT_CONFIG)
+    # 写一份空白人格模板
+    tmpl = paths.prompts_dir() / "persona.md"
+    if not tmpl.is_file():
+        tmpl.write_text(
+            "# 人格\n\n"
+            "在这里描述你希望助手是什么样的人。\n"
+            "这段文字会作为 system prompt 的一部分。\n",
+            encoding="utf-8",
+        )
+    out(f"{C.green}✓{C.reset} 配置已创建：{f}")
+    out(f"{C.dim}下一步：noelle oobe 配置模型，或 noelle config 手动编辑{C.reset}")
+    return 0
+
+
+# ============================================================
+# oobe 新手引导
+# ============================================================
+def cmd_oobe(args) -> int:
+    paths.ensure_dirs()
+    cfg = cfgmod.load()
+    from .llm.providers import PROVIDERS
+
+    out(f"{C.bold}noelle 新手引导{C.reset}")
+    out("─" * 52)
+
+    # 1. provider
+    ids = [p for p in PROVIDERS if p != "custom"]
+    out(f"\n{C.cyan}1. 选择模型提供方{C.reset}")
+    for i, pid in enumerate(ids, 1):
+        p = PROVIDERS[pid]
+        out(f"   {i}) {p.name:14s} {p.base_url}")
+    out(f"   {len(ids)+1}) 自定义")
+
+    choice = prompt_input(f"{C.cyan}编号 [1] › {C.reset}").strip() or "1"
+    try:
+        idx = int(choice) - 1
+    except ValueError:
+        idx = 0
+    pid = ids[idx] if 0 <= idx < len(ids) else "custom"
+    prov = PROVIDERS[pid]
+
+    base_url = prov.base_url
+    if pid == "custom":
+        base_url = prompt_input("base_url › ").strip()
+
+    # 2. 模型
+    out(f"\n{C.cyan}2. 模型{C.reset}")
+    if prov.models:
+        for i, m in enumerate(prov.models, 1):
+            out(f"   {i}) {m}")
+        mc = prompt_input(f"{C.cyan}编号 [1] › {C.reset}").strip() or "1"
+        try:
+            model = prov.models[int(mc) - 1]
+        except (ValueError, IndexError):
+            model = prov.models[0]
+    else:
+        model = prompt_input("模型名 › ").strip()
+
+    # 3. Key
+    api_key = ""
+    if pid != "ollama":
+        out(f"\n{C.cyan}3. API Key{C.reset}")
+        if prov.api_key_env:
+            out(f"   {C.dim}也可留空，改用环境变量 {prov.api_key_env}{C.reset}")
+        api_key = prompt_input(f"{C.cyan}key › {C.reset}").strip()
+
+    # 4. 人格
+    out(f"\n{C.cyan}4. 人格（可留空）{C.reset}")
+    persona = prompt_input(f"{C.cyan}描述 › {C.reset}").strip()
+
+    # 保存
+    entry = {
+        "id": pid,
+        "base_url": base_url,
+        "api_key": api_key,
+        "models": [model],
+    }
+    cfg["active_provider"] = pid
+    cfg["active_model"] = model
+    existing = [e for e in cfg.get("providers") or [] if e.get("id") != pid]
+    cfg["providers"] = existing + [entry]
+
+    if persona:
+        pf = paths.prompts_dir() / "persona.md"
+        pf.write_text(persona + "\n", encoding="utf-8")
+        cfg["prompt"]["active_persona"] = "persona.md"
+    else:
+        cfg["prompt"]["active_persona"] = ""
+
+    cfg["oobe_done"] = True
+    cfgmod.save(cfg)
+
+    out(f"\n{C.green}✓ 引导完成{C.reset}")
+    out(f"{C.dim}配置：{paths.config_file()}{C.reset}")
+    out(f"{C.dim}测试：noelle ask \"只回两个字：在线\"{C.reset}")
+    return 0
+
+
+# ============================================================
+# ask / chat / repl
+# ============================================================
+def _print_event(kind: str, payload: str, state: dict) -> None:
+    if kind == "text":
+        if not state.get("writing"):
+            sys.stdout.write(C.reset)
+            state["writing"] = True
+        sys.stdout.write(payload)
+        sys.stdout.flush()
+    elif kind == "reasoning":
+        if state.get("show_reasoning"):
+            sys.stdout.write(f"{C.grey}{payload}{C.reset}")
+            sys.stdout.flush()
+    elif kind == "tool":
+        if state.get("writing"):
+            sys.stdout.write("\n")
+            state["writing"] = False
+        out(f"{C.magenta}⚙ {payload}{C.reset}")
+    elif kind == "tool_result":
+        out(f"{C.dim}  ↳ {payload}{C.reset}")
+    elif kind == "error":
+        out(f"{C.red}✗ {payload}{C.reset}")
+    elif kind == "done":
+        if state.get("writing"):
+            sys.stdout.write(C.reset + "\n")
+            sys.stdout.flush()
+            state["writing"] = False
+
+
+def cmd_ask(args) -> int:
+    text = " ".join(args.message).strip()
+    if not text and not sys.stdin.isatty():
+        text = sys.stdin.read().strip()
+    if not text:
+        err("用法: noelle ask \"问题\"")
+        return 2
+
+    cfg = cfgmod.load()
+    a = Agent(cfg)
+    show_r = cfg.get("display", {}).get("expand_reasoning", False)
+    state = {"show_reasoning": show_r}
+    try:
+        a.run(text, stream=True, on_event=lambda e: _print_event(e[0], e[1], state))
+    except LLMError as e:
+        err(str(e))
+        return 1
+    return 0
+
+
+def cmd_repl(args, mode: str = "normal") -> int:
+    paths.ensure_dirs()
+    cfg = cfgmod.load()
+
+    if not cfg.get("oobe_done") and not cfg.get("active_provider"):
+        out(f"{C.yellow}首次使用，先跑一遍引导{C.reset}\n")
+        cmd_oobe(args)
+        cfg = cfgmod.load()
+
+    db = get_db()
+    # 复用终端会话
+    name = f"terminal-{mode}"
+    row = db.get_session(name)
+    if row is None:
+        sid = db.create_session(
+            name, mode=mode,
+            persona=cfg.get("prompt", {}).get("active_persona", ""),
+            provider=cfg.get("active_provider", ""),
+            model=cfg.get("active_model", ""),
+        )
+    else:
+        sid = row["id"]
+
+    a = Agent(cfg)
+    try:
+        pid, model, _ = a.resolve()
+    except LLMError:
+        pid, model = "未配置", ""
+
+    if mode == "normal":
+        banner()
+    out(f"{C.dim}{pid}/{model} · /exit 退出 · /help 帮助{C.reset}")
+    out("")
+
+    show_r = cfg.get("display", {}).get("expand_reasoning", False)
+    while True:
+        try:
+            line = prompt_input(f"{C.green}你 › {C.reset}").strip()
+        except SystemExit:
+            break
+        if not line:
+            continue
+        if line in ("/exit", "/quit", "exit", "quit"):
+            break
+        if line in ("/help", "/?"):
+            out("/exit   退出\n/reset  清空当前会话上下文\n"
+                "/history 最近消息\n/config 配置路径\n/tools  列出工具")
+            continue
+        if line == "/reset":
+            db.clear_session(sid)
+            out(f"{C.dim}上下文已清空{C.reset}\n")
+            continue
+        if line == "/config":
+            out(str(paths.config_file()) + "\n")
+            continue
+        if line == "/tools":
+            out(" ".join(tools.names()) + "\n")
+            continue
+        if line == "/history":
+            for r in db.messages(sid)[-10:]:
+                who = "你" if r["role"] == "user" else "noelle"
+                out(f"{C.dim}{who}:{C.reset} {r['content'][:120]}")
+            out("")
+            continue
+
+        state = {"show_reasoning": show_r}
+        try:
+            a.chat(sid, line, stream=True,
+                   on_event=lambda e: _print_event(e[0], e[1], state))
+        except LLMError as e:
+            err(str(e))
+        out("")
+    return 0
+
+
+# ============================================================
+# session
+# ============================================================
+def cmd_session(args) -> int:
+    db = get_db()
+    sub = args.action
+    if sub == "list" or sub is None:
+        rows = db.list_sessions()
+        if not rows:
+            out("(无会话)")
+            return 0
+        data = []
+        for i, r in enumerate(rows, 1):
+            data.append([
+                str(i), r["name"], r["mode"],
+                str(r["msgs"]),
+                time.strftime("%m-%d %H:%M", time.localtime(r["updated_at"])),
+            ])
+        out(table(data, ["#", "名称", "模式", "消息", "更新"]))
+        return 0
+
+    if sub == "new":
+        sid = db.create_session(
+            args.name or f"session-{int(time.time())}",
+            mode=args.mode or "normal",
+        )
+        out(f"{C.green}✓{C.reset} 已创建会话 {sid}")
+        return 0
+
+    row = db.get_session(args.key or "")
+    if not row:
+        err(f"会话不存在: {args.key}")
+        return 1
+    sid = row["id"]
+
+    if sub == "show":
+        out(f"id      : {sid}")
+        out(f"名称    : {row['name']}")
+        out(f"模式    : {row['mode']}")
+        out(f"人格    : {row['persona'] or '(无)'}")
+        out(f"模型    : {row['provider']}/{row['model']}")
+        out(f"消息数  : {db.message_count(sid)}")
+        return 0
+    if sub == "delete":
+        db.delete_session(sid)
+        out(f"{C.green}✓{C.reset} 已删除")
+        return 0
+    if sub == "rename":
+        db.rename_session(sid, args.name or "")
+        out(f"{C.green}✓{C.reset} 已重命名")
+        return 0
+    if sub == "clear":
+        db.clear_session(sid)
+        out(f"{C.green}✓{C.reset} 已清空")
+        return 0
+    if sub == "pop":
+        n = db.pop_messages(sid, args.count or 1)
+        out(f"{C.green}✓{C.reset} 移出 {n} 条消息")
+        return 0
+    err(f"未知操作: {sub}")
+    return 1
+
+
+# ============================================================
+# kb / memory
+# ============================================================
+def cmd_kb(args) -> int:
+    db = get_db()
+    sub = args.action
+    if sub == "list" or sub is None:
+        rows = db.list_kb()
+        if not rows:
+            out("(知识库为空)")
+            return 0
+        data = [[str(r["id"]), r["title"], r["path"]] for r in rows]
+        out(table(data, ["id", "标题", "路径"]))
+        return 0
+    if sub == "add":
+        p = Path(args.path).expanduser()
+        if not p.is_file():
+            err(f"文件不存在: {p}")
+            return 1
+        content = p.read_text(encoding="utf-8", errors="replace")
+        doc_id = db.add_kb_doc(p.stem, str(p), content)
+        out(f"{C.green}✓{C.reset} 已导入 id={doc_id}（{len(content)} 字符）")
+        return 0
+    if sub == "search":
+        rows = db.search_kb(args.query or "")
+        for r in rows:
+            out(f"{C.bold}## {r['title']}{C.reset}")
+            out(r["content"][:300])
+            out("")
+        return 0
+    if sub == "delete":
+        db.delete_kb_doc(int(args.key or 0))
+        out(f"{C.green}✓{C.reset} 已删除")
+        return 0
+    err(f"未知操作: {sub}")
+    return 1
+
+
+def cmd_memory(args) -> int:
+    db = get_db()
+    sub = args.action
+    if sub == "list" or sub is None:
+        rows = db.list_memories()
+        if not rows:
+            out("(无记忆)")
+            return 0
+        for r in rows:
+            out(f"{C.dim}[{r['id']}]{C.reset} {r['content']}")
+        return 0
+    if sub == "add":
+        mid = db.add_memory(" ".join(args.text or []))
+        out(f"{C.green}✓{C.reset} 已记住 id={mid}")
+        return 0
+    if sub == "search":
+        rows = db.search_memories(args.query or "")
+        for r in rows:
+            out(f"{C.dim}[{r['id']}]{C.reset} {r['content']}")
+        return 0
+    if sub == "delete":
+        db.delete_memory(int(args.key or 0))
+        out(f"{C.green}✓{C.reset} 已删除")
+        return 0
+    if sub == "clear":
+        n = db.clear_memories()
+        out(f"{C.green}✓{C.reset} 已清空 {n} 条")
+        return 0
+    err(f"未知操作: {sub}")
+    return 1
+
+
+# ============================================================
+# 杂项
+# ============================================================
+def cmd_paths(args) -> int:
+    for k, v in paths.all_paths().items():
+        out(f"{k:12s} {v}")
+    return 0
+
+
+def cmd_models(args) -> int:
+    cfg = cfgmod.load()
+    cur_p = cfg.get("active_provider")
+    cur_m = cfg.get("active_model")
+    rows = []
+    for pid, model, name in list_models(cfg):
+        mark = "→" if (pid == cur_p and model == cur_m) else " "
+        rows.append([mark, pid, model, name])
+    if rows:
+        out(table(rows, ["", "provider", "model", "名称"]))
+    else:
+        out("(未配置模型)")
+    return 0
+
+
+def cmd_tools(args) -> int:
+    rows = []
+    for t in tools.all():
+        rows.append([t.name, "⚠" if t.dangerous else "", t.description[:50]])
+    out(table(rows, ["名称", "", "说明"]))
+    return 0
+
+
+def cmd_config(args) -> int:
+    cfg = cfgmod.load()
+    if args.key and args.value is not None:
+        try:
+            val = json.loads(args.value)
+        except json.JSONDecodeError:
+            val = args.value
+        cfgmod.set_value(args.key, val)
+        out(f"{C.green}✓{C.reset} {args.key} = {val}")
+        return 0
+    if args.key:
+        out(json.dumps(cfgmod.get(args.key), ensure_ascii=False, indent=2))
+        return 0
+    out(json.dumps(cfg, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_history(args) -> int:
+    db = get_db()
+    row = db.get_session(args.session or "terminal-normal")
+    if not row:
+        out("(无会话)")
+        return 0
+    for r in db.messages(row["id"])[-int(args.limit or 20):]:
+        who = "你" if r["role"] == "user" else "noelle"
+        ts = time.strftime("%H:%M", time.localtime(r["created_at"]))
+        out(f"{C.dim}{ts} {who}:{C.reset} {r['content'][:200]}")
+    return 0
+
+
+def cmd_reset(args) -> int:
+    db = get_db()
+    row = db.get_session("terminal-normal")
+    if row:
+        db.clear_session(row["id"])
+        out(f"{C.green}✓{C.reset} 终端会话上下文已清空")
+    return 0
+
+
+def cmd_wipe(args) -> int:
+    if not args.yes:
+        ans = prompt_input("将删除所有会话、消息、记忆、用量记录。确认？[y/N] ")
+        if ans.strip().lower() not in ("y", "yes"):
+            out("已取消")
+            return 0
+    db = get_db()
+    db.wipe()
+    db.vacuum()
+    out(f"{C.green}✓{C.reset} 已抹除")
+    return 0
+
+
+def cmd_persona(args) -> int:
+    cfg = cfgmod.load()
+    pf = paths.prompts_dir() / "persona.md"
+    if args.text:
+        paths.ensure_dirs()
+        pf.write_text(" ".join(args.text) + "\n", encoding="utf-8")
+        cfg["prompt"]["active_persona"] = "persona.md"
+        cfgmod.save(cfg)
+        out(f"{C.green}✓{C.reset} 人格已保存")
+        return 0
+    if args.clear:
+        cfg["prompt"]["active_persona"] = ""
+        cfgmod.save(cfg)
+        out(f"{C.green}✓{C.reset} 人格已停用")
+        return 0
+    if pf.is_file():
+        out(pf.read_text(encoding="utf-8"))
+    else:
+        out("(未设置人格)")
+    return 0
+
+
+def cmd_export(args) -> int:
+    import zipfile
+    cfg = cfgmod.load()
+    cfg.pop("providers", None)  # 不导出 key
+    out_path = Path(args.output or "noelle-export.zip").expanduser()
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("config.json", json.dumps(cfg, ensure_ascii=False, indent=2))
+        for f in paths.prompts_dir().glob("*.md"):
+            z.write(f, f"prompts/{f.name}")
+    out(f"{C.green}✓{C.reset} 已导出 {out_path}（不含 API Key）")
+    return 0
+
+
+def cmd_import(args) -> int:
+    import zipfile
+    src = Path(args.archive).expanduser()
+    if not src.is_file():
+        err(f"归档不存在: {src}")
+        return 1
+    paths.ensure_dirs()
+    with zipfile.ZipFile(src) as z:
+        for name in z.namelist():
+            if name == "config.json":
+                data = json.loads(z.read(name))
+                cur = cfgmod.load()
+                cur.update({k: v for k, v in data.items() if k != "providers"})
+                cfgmod.save(cur)
+            elif name.startswith("prompts/") and name.endswith(".md"):
+                (paths.prompts_dir() / Path(name).name).write_bytes(z.read(name))
+    out(f"{C.green}✓{C.reset} 已导入")
+    return 0
+
+
+def cmd_reload(args) -> int:
+    out(f"{C.green}✓{C.reset} 配置已重新加载")
+    return 0
+
+
+# ============================================================
+# shell 集成
+# ============================================================
+def cmd_shell_init(args) -> int:
+    from .shell import generate
+    from .shell.hooks import hooks_path
+    text = generate(args.shell)
+    if not text:
+        err(f"不支持的 shell: {args.shell}")
+        return 1
+    target = Path(hooks_path(args.shell)).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        bak = target.with_suffix(target.suffix + ".bak")
+        bak.write_bytes(target.read_bytes())
+    target.write_text(text, encoding="utf-8")
+    out(f"{C.green}✓{C.reset} 已写入 {target}")
+    if args.shell == "fish":
+        out(f"{C.dim}新开终端或执行: source {target}{C.reset}")
+    else:
+        out(f"{C.dim}重开终端或执行: source {target}{C.reset}")
+    return 0
+
+
+def cmd_shell_remove(args) -> int:
+    from .shell.hooks import hooks_path
+    target = Path(hooks_path(args.shell)).expanduser()
+    if target.is_file() and "noelle" in target.read_text(encoding="utf-8", errors="ignore"):
+        target.unlink()
+        out(f"{C.green}✓{C.reset} 已移除 {target}")
+    else:
+        out("(未找到 noelle hook)")
+    return 0
+
+
+def cmd_shell_classify(args) -> int:
+    from .shell import classify
+    line = sys.stdin.read() if args.stdin else " ".join(args.text or [])
+    print(classify(line))
+    return 0
+
+
+def cmd_shell_intercept(args) -> int:
+    """被 shell hook 调用：把自然语言交给 noelle，打印结果"""
+    from .shell import classify
+    line = " ".join(args.text or []).strip()
+    if not line:
+        line = sys.stdin.read().strip()
+    if not line:
+        return 0
+    if classify(line) != "natural":
+        # 不是自然语言就交回 shell
+        print(line)
+        return 0
+    args.message = [line]
+    return cmd_ask(args)
+
+
+# ============================================================
+# daemon
+# ============================================================
+def cmd_daemon(args) -> int:
+    from . import daemon
+    sub = args.action or "status"
+
+    if sub == "start":
+        st = daemon.status()
+        if st.get("running"):
+            out(f"已在运行 pid={st['pid']}")
+            return 0
+        import subprocess
+        env = dict(os.environ)
+        subprocess.Popen(
+            [sys.executable, "-m", "noelle.daemon"],
+            env=env, start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        for _ in range(50):
+            time.sleep(0.1)
+            if daemon.status().get("running"):
+                break
+        st = daemon.status()
+        if st.get("running"):
+            out(f"{C.green}✓{C.reset} daemon 已启动 pid={st['pid']}")
+            return 0
+        err("启动失败（查看 ~/.noelle/cache/logs）")
+        return 1
+
+    if sub == "stop":
+        if daemon.stop():
+            out(f"{C.green}✓{C.reset} daemon 已停止")
+        else:
+            out("(未运行)")
+        return 0
+
+    if sub == "restart":
+        daemon.stop()
+        time.sleep(0.3)
+        args.action = "start"
+        return cmd_daemon(args)
+
+    st = daemon.status()
+    if st.get("running"):
+        out(f"{C.green}运行中{C.reset} pid={st['pid']}")
+        out(f"socket: {st['socket']}")
+    else:
+        out("未运行")
+    return 0
+
+
+# ============================================================
+# 插件
+# ============================================================
+def cmd_plugins(args) -> int:
+    from .plugins import load_all
+    loaded = load_all()
+    out(f"Python 插件: {', '.join(loaded['python']) or '(无)'}")
+    out(f"脚本工具  : {', '.join(loaded['scripts']) or '(无)'}")
+    out(f"{C.dim}目录: {paths.extensions_dir()}{C.reset}")
+    return 0
+
+
+# ============================================================
+# 语音（占位，需可选依赖）
+# ============================================================
+def cmd_stt(args) -> int:
+    err("语音功能需要可选依赖: pip install noelle[voice]")
+    return 1
+
+
+def cmd_voice(args) -> int:
+    err("语音功能需要可选依赖: pip install noelle[voice]")
+    return 1
+
+
+# ============================================================
+# 用量
+# ============================================================
+def cmd_usage(args) -> int:
+    db = get_db()
+    since = 0.0
+    if args.days:
+        since = time.time() - int(args.days) * 86400
+    u = db.usage_summary(since)
+    out(f"调用次数: {u['calls']}")
+    out(f"输入 token: {u['prompt']}")
+    out(f"输出 token: {u['completion']}")
+    out(f"合计      : {u['prompt'] + u['completion']}")
+    return 0
+
+
+# ============================================================
+# 兼容层：对齐上游 miyu 的命令名
+# ============================================================
+def cmd_pop(args) -> int:
+    db = get_db()
+    row = db.get_session(args.session or "terminal-normal")
+    if not row:
+        err("无终端会话")
+        return 1
+    n = db.pop_messages(row["id"], args.count or 1)
+    out(f"{C.green}✓{C.reset} 移出 {n} 条")
+    return 0
+
+
+def cmd_compact(args) -> int:
+    """压缩上下文：保留最近 N 条，其余丢弃。"""
+    db = get_db()
+    row = db.get_session(args.session or "terminal-normal")
+    if not row:
+        err("无终端会话")
+        return 1
+    sid = row["id"]
+    total = db.message_count(sid)
+    keep = args.keep or 10
+    if total <= keep:
+        out(f"消息 {total} 条，无需压缩")
+        return 0
+    drop = total - keep
+    db.pop_messages(sid, drop)
+    out(f"{C.green}✓{C.reset} 已压缩：{total} → {keep} 条")
+    return 0
+
+
+def cmd_reset_memory(args) -> int:
+    db = get_db()
+    row = db.get_session(args.session or "terminal-normal")
+    n = db.clear_memories(row["persona"] if row else "")
+    out(f"{C.green}✓{C.reset} 清空 {n} 条记忆")
+    return 0
+
+
+def cmd_reset_all_memory(args) -> int:
+    cfg = cfgmod.load()
+    persona = cfg.get("prompt", {}).get("active_persona", "")
+    n = get_db().clear_memories(persona)
+    out(f"{C.green}✓{C.reset} 人格 {persona or '(无)'} 的记忆已清空（{n} 条）")
+    return 0
+
+
+def cmd_skills(args) -> int:
+    d = paths.extensions_dir() / "skills"
+    d.mkdir(parents=True, exist_ok=True)
+    sub = args.action or "list"
+    if sub == "list":
+        items = sorted(d.iterdir()) if d.is_dir() else []
+        if not items:
+            out(f"(skills 为空)\n{C.dim}目录: {d}{C.reset}")
+            return 0
+        for f in items:
+            out(f"· {f.name}")
+        return 0
+    if sub == "dir":
+        out(str(d))
+        return 0
+    if sub == "run":
+        target = d / (args.name or "")
+        if not (target / "SKILL.md").is_file() and target.suffix != ".md":
+            err(f"skill 不存在: {target}")
+            return 1
+        md = target / "SKILL.md" if target.is_dir() else target
+        args.message = [f"请按以下 skill 执行：\n\n{md.read_text(encoding='utf-8')}"]
+        return cmd_ask(args)
+    err(f"未知操作: {sub}")
+    return 1
+
+
+def cmd_stdio(args) -> int:
+    """长驻协议：stdin 一行一请求（JSON），stdout 一行一事件。"""
+    from .agent import Agent
+    agent = Agent()
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError:
+            print(json.dumps({"event": "error", "message": "JSON 解析失败"},
+                             ensure_ascii=False), flush=True)
+            continue
+        op = req.get("op", "ask")
+        if op == "exit":
+            break
+        if op != "ask":
+            print(json.dumps({"event": "error", "message": f"未知 op: {op}"},
+                             ensure_ascii=False), flush=True)
+            continue
+        try:
+            turn = agent.run(
+                req.get("text", ""), stream=False,
+            )
+            print(json.dumps({
+                "event": "done", "text": turn.text,
+                "tokens": [turn.prompt_tokens, turn.completion_tokens],
+            }, ensure_ascii=False), flush=True)
+        except LLMError as e:
+            print(json.dumps({"event": "error", "message": str(e)},
+                             ensure_ascii=False), flush=True)
+    return 0
+
+
+def cmd_tool_call(args) -> int:
+    """以本会话身份直接调用一个工具，绕过 LLM。"""
+    name = args.name or ""
+    try:
+        call_args = json.loads(args.args) if args.args else {}
+    except json.JSONDecodeError:
+        err("--args 需是合法 JSON")
+        return 2
+    res = tools.call(name, call_args)
+    if res.ok:
+        out(res.content)
+        return 0
+    err(res.error)
+    return 1
+
+
+def cmd_web(args) -> int:
+    """极简本地 WebUI。"""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from .agent import Agent
+    import urllib.parse
+
+    host = args.host or "127.0.0.1"
+    port = args.port or 7789
+    page = """<!doctype html><meta charset="utf-8">
+<title>noelle</title>
+<style>
+body{font:15px/1.6 ui-monospace,monospace;max-width:820px;margin:40px auto;padding:0 20px;
+     background:#1a1b26;color:#c0caf5}
+h1{font-size:18px;color:#7aa2f7}
+#log{white-space:pre-wrap;border:1px solid #2f334d;border-radius:8px;padding:16px;
+     height:60vh;overflow:auto;background:#16161e}
+input{width:100%;box-sizing:border-box;padding:10px;margin-top:12px;border-radius:6px;
+      border:1px solid #2f334d;background:#16161e;color:#c0caf5;font:inherit}
+.u{color:#9ece6a}.a{color:#c0caf5}
+</style>
+<h1>noelle</h1>
+<div id="log"></div>
+<input id="q" placeholder="输入问题，回车发送…" autofocus>
+<script>
+const log=document.getElementById('log'),q=document.getElementById('q');
+let sid=localStorage.getItem('sid')||'';
+function add(c,t){const d=document.createElement('div');d.className=c;d.textContent=t;
+  log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
+q.oninput=()=>{};
+q.onkeydown=async e=>{
+  if(e.key!=='Enter'||!q.value.trim())return;
+  const text=q.value.trim();q.value='';
+  add('u','你 › '+text);
+  const out=add('a','noelle › ');
+  const r=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({text,session:sid})});
+  const j=await r.json();
+  sid=j.session||sid;localStorage.setItem('sid',sid);
+  out.textContent='noelle › '+(j.text||j.error||'(空)');
+};
+</script>"""
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if self.path not in ("/", "/index.html"):
+                self.send_error(404)
+                return
+            body = page.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            if self.path != "/ask":
+                self.send_error(404)
+                return
+            n = int(self.headers.get("Content-Length") or 0)
+            req = json.loads(self.rfile.read(n) or b"{}")
+            agent = Agent()
+            db = get_db()
+            sid = req.get("session") or ""
+            if not sid or not db.get_session(sid):
+                sid = db.create_session(f"web-{int(time.time())}")
+            try:
+                turn = agent.chat(sid, req.get("text", ""), stream=False)
+                payload = {"text": turn.text, "session": sid}
+            except LLMError as e:
+                payload = {"error": str(e), "session": sid}
+            body = json.dumps(payload, ensure_ascii=False).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer((host, port), H)
+    out(f"{C.green}✓{C.reset} WebUI: http://{host}:{port}")
+    out(f"{C.dim}Ctrl+C 停止{C.reset}")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        out("\n已停止")
+    finally:
+        srv.server_close()
+    return 0
+
+
+def cmd_layout(args) -> int:
+    out(f"{C.bold}数据布局{C.reset}")
+    for k, v in paths.all_paths().items():
+        p = Path(v)
+        mark = "✓" if p.exists() else " "
+        out(f"  {mark} {k:12s} {v}")
+    if args.apply:
+        paths.ensure_dirs()
+        out(f"{C.green}✓{C.reset} 目录已创建")
+    return 0
+
+
+def cmd_embed(args) -> int:
+    db = get_db()
+    sub = args.action or "status"
+    docs = db.list_kb()
+    if sub == "status":
+        out(f"知识库条目: {len(docs)}")
+        out(f"{C.dim}embedding 需可选依赖，当前使用关键词检索{C.reset}")
+        return 0
+    if sub == "rebuild":
+        # 关键词索引无需重建，仅提示
+        out(f"{C.green}✓{C.reset} 关键词索引就绪（{len(docs)} 条）")
+        return 0
+    if sub == "models":
+        out("(未安装 embedding 模型)")
+        return 0
+    err(f"未知操作: {sub}")
+    return 1
+
+
+def cmd_effort(args) -> int:
+    cfg = cfgmod.load()
+    if args.level:
+        cfg["effort"] = args.level
+        cfgmod.save(cfg)
+        out(f"{C.green}✓{C.reset} 思考档位 = {args.level}")
+        return 0
+    out(f"当前档位: {cfg.get('effort', 'default')}")
+    return 0
+
+
+def cmd_listen(args) -> int:
+    err("语音收听需可选依赖: pip install noelle[voice]")
+    return 1
+
+
+def cmd_update_default_kb(args) -> int:
+    import zipfile
+    from . import __file__ as pkg_file
+    src = Path(pkg_file).parent.parent / "assets" / "default-kb.zip"
+    if not src.is_file():
+        out("(未内置默认知识库，跳过)")
+        return 0
+    db = get_db()
+    with zipfile.ZipFile(src) as z:
+        for n in z.namelist():
+            if n.endswith(".md"):
+                db.add_kb_doc(Path(n).stem, n, z.read(n).decode("utf-8", "replace"))
+    out(f"{C.green}✓{C.reset} 默认知识库已更新")
+    return 0
+
+
+def cmd_list_models(args) -> int:
+    return cmd_models(args)
+
+
+# ============================================================
+# 参数解析
+# ============================================================
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="noelle",
+        description="noelle — 终端 AI 助手",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "示例:\n"
+            "  noelle                      进入对话\n"
+            "  noelle ask \"解释 Btrfs 快照\"\n"
+            "  noelle kb add README.md\n"
+            "  noelle session list\n"
+        ),
+    )
+    p.add_argument("-v", "--version", action="version", version=f"noelle {__version__}")
+    p.add_argument("--stdout", action="store_true", help="纯文本输出")
+    sub = p.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("init", help="创建配置文件")
+    sp.add_argument("--force", action="store_true")
+    sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("oobe", help="新手引导")
+    sp.set_defaults(func=cmd_oobe)
+
+    sp = sub.add_parser("normal", help="普通对话模式")
+    sp.set_defaults(func=lambda a: cmd_repl(a, "normal"))
+
+    sp = sub.add_parser("dev", help="开发模式（无人格）")
+    sp.set_defaults(func=lambda a: cmd_repl(a, "dev"))
+
+    sp = sub.add_parser("ask", help="单次提问")
+    sp.add_argument("message", nargs="*")
+    sp.set_defaults(func=cmd_ask)
+
+    sp = sub.add_parser("session", help="会话管理")
+    sp.add_argument("action", nargs="?", default="list",
+                    choices=["list", "new", "show", "delete", "rename", "clear", "pop"])
+    sp.add_argument("key", nargs="?", default="")
+    sp.add_argument("--name")
+    sp.add_argument("--mode", choices=["normal", "dev"])
+    sp.add_argument("--count", type=int)
+    sp.set_defaults(func=cmd_session)
+
+    sp = sub.add_parser("kb", help="知识库")
+    sp.add_argument("action", nargs="?", default="list",
+                    choices=["list", "add", "search", "delete"])
+    sp.add_argument("path", nargs="?", default="")
+    sp.add_argument("--query")
+    sp.add_argument("--key")
+    sp.set_defaults(func=cmd_kb)
+
+    sp = sub.add_parser("memory", help="记忆")
+    sp.add_argument("action", nargs="?", default="list",
+                    choices=["list", "add", "search", "delete", "clear"])
+    sp.add_argument("text", nargs="*")
+    sp.add_argument("--query")
+    sp.add_argument("--key")
+    sp.set_defaults(func=cmd_memory)
+
+    sp = sub.add_parser("paths", help="显示路径")
+    sp.set_defaults(func=cmd_paths)
+
+    sp = sub.add_parser("models", help="列出模型")
+    sp.set_defaults(func=cmd_models)
+
+    sp = sub.add_parser("list-models", help="列出模型")
+    sp.set_defaults(func=cmd_list_models)
+
+    sp = sub.add_parser("tools", help="列出工具")
+    sp.set_defaults(func=cmd_tools)
+
+    sp = sub.add_parser("config", help="查看或修改配置")
+    sp.add_argument("key", nargs="?")
+    sp.add_argument("value", nargs="?")
+    sp.set_defaults(func=cmd_config)
+
+    sp = sub.add_parser("history", help="查看历史")
+    sp.add_argument("--session")
+    sp.add_argument("--limit", type=int, default=20)
+    sp.set_defaults(func=cmd_history)
+
+    sp = sub.add_parser("reset", help="清空终端会话上下文")
+    sp.set_defaults(func=cmd_reset)
+
+    sp = sub.add_parser("wipe", help="抹除所有数据")
+    sp.add_argument("-y", "--yes", action="store_true")
+    sp.set_defaults(func=cmd_wipe)
+
+    sp = sub.add_parser("persona", help="人格管理")
+    sp.add_argument("text", nargs="*")
+    sp.add_argument("--clear", action="store_true")
+    sp.set_defaults(func=cmd_persona)
+
+    sp = sub.add_parser("export", help="导出配置")
+    sp.add_argument("output", nargs="?")
+    sp.set_defaults(func=cmd_export)
+
+    sp = sub.add_parser("import", help="导入配置")
+    sp.add_argument("archive")
+    sp.set_defaults(func=cmd_import)
+
+    sp = sub.add_parser("reload", help="重新加载配置")
+    sp.set_defaults(func=cmd_reload)
+
+    for sh in ("fish", "bash", "zsh"):
+        sp = sub.add_parser(f"{sh}-init", help=f"安装 {sh} 集成")
+        sp.add_argument("shell", nargs="?", default=sh)
+        sp.set_defaults(func=cmd_shell_init)
+
+    sp = sub.add_parser("remove-shell-hook", help="移除 shell 集成")
+    sp.add_argument("shell", nargs="?", default="fish")
+    sp.set_defaults(func=cmd_shell_remove)
+
+    sp = sub.add_parser("daemon", help="后台服务")
+    sp.add_argument("action", nargs="?", default="status",
+                    choices=["start", "stop", "restart", "status"])
+    sp.set_defaults(func=cmd_daemon)
+
+    sp = sub.add_parser("plugins", help="查看已加载插件")
+    sp.set_defaults(func=cmd_plugins)
+
+    sp = sub.add_parser("stt", help="语音转文字（需可选依赖）")
+    sp.set_defaults(func=cmd_stt)
+
+    sp = sub.add_parser("voice", help="语音播报（需可选依赖）")
+    sp.set_defaults(func=cmd_voice)
+
+    sp = sub.add_parser("usage", help="token 用量统计")
+    sp.add_argument("--days", type=int, default=0)
+    sp.set_defaults(func=cmd_usage)
+
+    # ---- 与上游对齐的命令 ----
+    sp = sub.add_parser("pop", help="移出最近 N 轮")
+    sp.add_argument("--session")
+    sp.add_argument("--count", type=int, default=1)
+    sp.set_defaults(func=cmd_pop)
+
+    sp = sub.add_parser("compact", help="压缩上下文")
+    sp.add_argument("--session")
+    sp.add_argument("--keep", type=int, default=10)
+    sp.set_defaults(func=cmd_compact)
+
+    sp = sub.add_parser("reset-memory", help="清空本次会话记忆")
+    sp.add_argument("--session")
+    sp.set_defaults(func=cmd_reset_memory)
+
+    sp = sub.add_parser("reset-all-memory", help="清空当前人格全部记忆")
+    sp.set_defaults(func=cmd_reset_all_memory)
+
+    sp = sub.add_parser("skills", help="skills 管理")
+    sp.add_argument("action", nargs="?", default="list",
+                    choices=["list", "dir", "run"])
+    sp.add_argument("name", nargs="?")
+    sp.set_defaults(func=cmd_skills)
+
+    sp = sub.add_parser("stdio", help="长驻 JSON 行协议")
+    sp.set_defaults(func=cmd_stdio)
+
+    sp = sub.add_parser("tool-call", help="直接调用工具")
+    sp.add_argument("name")
+    sp.add_argument("--args", default="")
+    sp.set_defaults(func=cmd_tool_call)
+
+    sp = sub.add_parser("web", help="启动本地 WebUI")
+    sp.add_argument("--host", default="127.0.0.1")
+    sp.add_argument("--port", type=int, default=7789)
+    sp.set_defaults(func=cmd_web)
+
+    sp = sub.add_parser("layout", help="数据布局")
+    sp.add_argument("--apply", action="store_true")
+    sp.set_defaults(func=cmd_layout)
+
+    sp = sub.add_parser("embed", help="向量索引")
+    sp.add_argument("action", nargs="?", default="status",
+                    choices=["status", "rebuild", "models"])
+    sp.set_defaults(func=cmd_embed)
+
+    sp = sub.add_parser("effort", help="思考档位")
+    sp.add_argument("level", nargs="?")
+    sp.set_defaults(func=cmd_effort)
+
+    sp = sub.add_parser("listen", help="开始语音收听")
+    sp.set_defaults(func=cmd_listen)
+
+    sp = sub.add_parser("update-default-kb", help="更新内置知识库")
+    sp.set_defaults(func=cmd_update_default_kb)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+
+    # 内部协议：shell hook 用，解析在 argparse 之前，避免污染子命令表
+    if argv and argv[0] in ("--shell-classify", "--shell-intercept"):
+        return _handle_shell_protocol(argv)
+
+    p = build_parser()
+    args = p.parse_args(argv)
+    if getattr(args, "stdout", False):
+        os.environ["NOELLE_NO_COLOR"] = "1"
+    if not getattr(args, "cmd", None):
+        return cmd_repl(args, "normal")
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        out("")
+        return 130
+    except LLMError as e:
+        err(str(e))
+        return 1
+
+
+def _handle_shell_protocol(argv: list[str]) -> int:
+    """解析 --shell-classify / --shell-intercept 及其参数。"""
+    mode = argv[0]
+    rest = argv[1:]
+    use_stdin = "--stdin" in rest
+    shell = ""
+    words: list[str] = []
+    skip = False
+    for i, a in enumerate(rest):
+        if skip:
+            skip = False
+            continue
+        if a == "--shell":
+            shell = rest[i + 1] if i + 1 < len(rest) else ""
+            skip = True
+        elif a in ("--stdin", "--"):
+            continue
+        else:
+            words.append(a)
+
+    text = sys.stdin.read() if use_stdin else " ".join(words)
+
+    from .shell import classify
+    verdict = classify(text)
+
+    if mode == "--shell-classify":
+        print(verdict)
+        return 0
+
+    # --shell-intercept
+    if verdict != "natural":
+        print(text)
+        return 0
+    ns = argparse.Namespace(message=[text], stdout=False)
+    return cmd_ask(ns)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

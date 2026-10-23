@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "noelle"
+version = "0.1.0"
+description = "终端 AI 助手 — 跨平台、可扩展、零第三方依赖"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "lsitvoid" }]
+keywords = ["ai", "cli", "terminal", "assistant", "llm"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.scripts]
+noelle = "noelle.cli:main"
+
+[project.optional-dependencies]
+voice = ["faster-whisper"]
+tui = ["prompt_toolkit"]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = [
+    "noelle",
+    "noelle.llm",
+    "noelle.tools",
+    "noelle.plugins",
+    "noelle.storage",
+    "noelle.shell",
+    "noelle.ui",
+]
