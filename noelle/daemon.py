@@ -3,7 +3,7 @@
 客户端发送一行 JSON 请求，服务端回一行 JSON 事件。
 这样前端（TUI / WebUI / 编辑器插件）都能复用同一个会话状态。
 
-Windows 没有 AF_UNIX（旧版本），回退到 127.0.0.1 TCP + token 文件。
+Windows 无 AF_UNIX 时回退到 127.0.0.1 TCP。
 """
 
 from __future__ import annotations

@@ -680,7 +680,7 @@ def cmd_usage(args) -> int:
 
 
 # ============================================================
-# 兼容层：对齐上游 miyu 的命令名
+# 完整命令集
 # ============================================================
 def cmd_pop(args) -> int:
     db = get_db()
@@ -1099,7 +1099,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--days", type=int, default=0)
     sp.set_defaults(func=cmd_usage)
 
-    # ---- 与上游对齐的命令 ----
+    # ---- 会话与上下文补充 ----
     sp = sub.add_parser("pop", help="移出最近 N 轮")
     sp.add_argument("--session")
     sp.add_argument("--count", type=int, default=1)
