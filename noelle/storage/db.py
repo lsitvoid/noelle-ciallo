@@ -63,6 +63,14 @@ CREATE TABLE IF NOT EXISTS kb_docs (
     updated_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_kb_title ON kb_docs(title);
+CREATE TABLE IF NOT EXISTS mood_log (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        REAL NOT NULL,
+    mood      INTEGER NOT NULL,            -- 0-100
+    delta     INTEGER NOT NULL DEFAULT 0,  -- 本轮涨跌
+    emotions  TEXT NOT NULL DEFAULT '{}',  -- 七情 JSON
+    reason    TEXT NOT NULL DEFAULT ''
+);
 
 CREATE TABLE IF NOT EXISTS usage (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

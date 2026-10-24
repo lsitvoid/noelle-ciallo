@@ -247,6 +247,12 @@ class Agent:
         if recall:
             messages.append(Message("system", recall))
 
+        if self.cfg.get("mood", {}).get("inject", True):
+            from .mood import current_state, inject_block
+            mblock = inject_block(current_state(get_db()))
+            if mblock:
+                messages.append(Message("system", mblock))
+
         def emit(kind: str, payload: str) -> None:
             if on_event:
                 on_event((kind, payload))
@@ -368,6 +374,13 @@ class Agent:
             self.distill(user_text, turn.text)
         except Exception:  # noqa: BLE001
             pass
+        # 心情判定（大肥鱼式）：判完下一轮语气受影响
+        if self.cfg.get("mood", {}).get("enabled", True):
+            from .mood import judge as mood_judge
+            try:
+                mood_judge(self, user_text, turn.text)
+            except Exception:  # noqa: BLE001
+                pass
         if turn.prompt_tokens or turn.completion_tokens:
             pid, model, _ = self.resolve()
             db.record_usage(pid, model, turn.prompt_tokens, turn.completion_tokens)

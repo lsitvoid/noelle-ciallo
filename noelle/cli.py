@@ -460,6 +460,47 @@ def cmd_paths(args) -> int:
     return 0
 
 
+def cmd_mood(args) -> int:
+    """心情状态与时间线（大肥鱼式情感系统）"""
+    from . import mood
+    db = get_db()
+    if args.action == "reset":
+        mood.reset(db)
+        out(f"{C.green}✓{C.reset} 已重置到基线 {mood.BASELINE}")
+        return 0
+    if args.action == "off":
+        cfg = cfgmod.load()
+        cfg.setdefault("mood", {})["enabled"] = False
+        cfgmod.save(cfg)
+        out("心情判定已关闭")
+        return 0
+    if args.action == "on":
+        cfg = cfgmod.load()
+        cfg.setdefault("mood", {})["enabled"] = True
+        cfgmod.save(cfg)
+        out("心情判定已开启")
+        return 0
+
+    st = mood.current_state(db)
+    bar_n = st["mood"] // 5
+    out(f"心情 {C.cyan}{st['mood']}/100{C.reset} "
+        f"{C.dim}{'█' * bar_n}{'░' * (20 - bar_n)}{C.reset} "
+        f"{mood.face(st['mood'])}")
+    emo = "  ".join(f"{k}{v:+d}" for k, v in st["emotions"].items())
+    out(f"七情: {emo}")
+    tl = mood.timeline(db)
+    if tl:
+        out(f"\n{C.dim}时间线:{C.reset}")
+        for r in tl:
+            d = f"{r['delta']:+d}"
+            col = C.green if r["delta"] > 0 else (C.red if r["delta"] < 0 else C.dim)
+            t = time.strftime("%m-%d %H:%M", time.localtime(r["ts"]))
+            out(f"  {C.dim}{t}{C.reset} {col}{d:>3}{C.reset} → {r['mood']:3d}  {r['reason']}")
+    else:
+        out(f"{C.dim}还没有心情记录，聊两句就有了{C.reset}")
+    return 0
+
+
 def cmd_models(args) -> int:
     cfg = cfgmod.load()
     cur_p = cfg.get("active_provider")
@@ -1150,6 +1191,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("tapall", help="全部历史对话，tapall <序号> 继续")
     sp.add_argument("index", nargs="?")
     sp.set_defaults(func=cmd_tapall)
+
+    sp = sub.add_parser("mood", help="心情状态与时间线")
+    sp.add_argument("action", nargs="?",
+                    choices=["show", "reset", "on", "off"], default="show")
+    sp.set_defaults(func=cmd_mood)
 
     sp = sub.add_parser("reset", help="清空终端会话上下文")
     sp.set_defaults(func=cmd_reset)

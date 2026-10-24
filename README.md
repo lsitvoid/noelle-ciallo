@@ -42,6 +42,7 @@ python3 run.py ask "你好"
 | 插件目录 | 内置 + 用户双层，逐个启停 |
 | 渲染成图 | markdown 表格 / 代码块 → PNG（typst） |
 | 聊天桥 | webhook 常驻服务，接入任意聊天软件 |
+| 心情系统 | 大肥鱼式情感：七情 + 半衰期衰减 + 时间线 |
 
 ### 工具（13 个内置）
 
@@ -130,6 +131,10 @@ noelle session pop <key> --count 2
 noelle tapall                # 全部历史对话
 noelle tapall 3              # 继续第 3 次对话
 
+noelle mood                  # 心情状态 + 时间线
+noelle mood reset            # 重置到基线
+noelle mood off              # 关闭心情判定
+
 noelle kb list               # 知识库
 noelle kb add <文件>
 noelle kb search --query x
@@ -216,6 +221,25 @@ noelle history [--limit 20]
 | `custom` | 自填 | 任意 |
 
 加新 provider 只需改 `noelle/llm/providers.py` 的 `PROVIDERS` 字典。
+
+---
+
+## 心情系统（大肥鱼式情感）
+
+机制移植自社区插件 dsh-feiyu-mood（MIT）：
+
+- 心情 0–100，基线 70；无新情绪按半衰期 3 小时回落
+- 七情（喜怒哀惧爱恶欲）各 -100..100，半衰期 90 分钟归零
+- 每轮对话后由模型判定涨跌 + 七情变化 + 一句理由，记时间线
+- 下一轮开始前注入上下文，语气真的受影响
+
+```bash
+noelle mood        # 心情 70/100 心情不错 + 七情 + 时间线
+noelle mood reset  # 重置到基线
+noelle mood off    # 关闭判定
+```
+
+配置：`"mood": {"enabled": true, "inject": true}`
 
 ---
 

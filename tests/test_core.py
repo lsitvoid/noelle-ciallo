@@ -310,3 +310,51 @@ def test_profile_block(tmp_home):
     blk = a.profile_block()
     assert "关于用户" in blk and "小明" in blk
     assert "关于你自己" in blk and "简短" in blk
+
+
+# ---------- mood（大肥鱼式情感系统） ----------
+
+def test_mood_decay():
+    from noelle import mood
+    import time
+    from noelle.storage import get_db
+    db = get_db()
+    db.conn().execute(
+        "INSERT INTO mood_log(ts,mood,delta,emotions,reason) VALUES(?,?,?,?,?)",
+        (time.time(), 90, 20,
+         '{"喜": 40, "怒": -40}', "测试"),
+    )
+    db.conn().commit()
+    st = mood.current_state(db)
+    assert 85 <= st["mood"] <= 90          # 刚发生，几乎没衰减
+    assert st["emotions"]["喜"] in (39, 40)
+    # 时间倒流 3 小时 → 心情回落约一半到基线的路上
+    db.conn().execute("UPDATE mood_log SET ts=?", (time.time() - 3 * 3600,))
+    db.conn().commit()
+    st = mood.current_state(db)
+    assert 79 <= st["mood"] <= 81          # (90-70)*0.5+70 = 80
+    assert st["emotions"]["喜"] == 10      # 40 * 0.25（两个情绪半衰期）
+    assert st["emotions"]["怒"] == -10
+
+
+def test_mood_face_and_inject():
+    from noelle import mood
+    assert "兴高采烈" in mood.face(90)
+    assert "平静" in mood.face(50)
+    blk = mood.inject_block({"mood": 75, "emotions": {"喜": 10, "怒": 0},
+                             "reason": "被夸"})
+    assert "[当前心情] 75/100" in blk and "被夸" in blk
+
+
+def test_mood_reset_and_cli():
+    from noelle import cli, mood
+    from noelle.storage import get_db
+    db = get_db()
+    db.conn().execute(
+        "INSERT INTO mood_log(ts,mood,delta,emotions,reason) VALUES(?,?,?,?,?)",
+        (__import__("time").time(), 30, -40, "{}", "test"),
+    )
+    db.conn().commit()
+    args = cli.build_parser().parse_args(["mood", "reset"])
+    assert cli.cmd_mood(args) == 0
+    assert mood.current_state(db)["mood"] == mood.BASELINE
