@@ -642,12 +642,33 @@ def cmd_daemon(args) -> int:
 # 插件
 # ============================================================
 def cmd_plugins(args) -> int:
-    from .plugins import load_all
-    loaded = load_all()
-    out(f"Python 插件: {', '.join(loaded['python']) or '(无)'}")
-    out(f"脚本工具  : {', '.join(loaded['scripts']) or '(无)'}")
-    out(f"{C.dim}目录: {paths.extensions_dir()}{C.reset}")
-    return 0
+    from .plugins import discover, set_enabled
+    sub = args.action or "list"
+
+    if sub == "list":
+        items = discover()
+        if not items:
+            out("(无插件)")
+            return 0
+        rows = [
+            ["✓" if i["enabled"] else "✗", i["name"], i["source"]]
+            for i in items
+        ]
+        out(table(rows, ["", "插件", "来源"]))
+        out(f"{C.dim}启用/停用: noelle plugins enable|disable <名>{C.reset}")
+        return 0
+
+    if sub in ("enable", "disable"):
+        name = args.name or ""
+        if set_enabled(name, sub == "enable"):
+            mark = f"{C.green}✓ 已启用{C.reset}" if sub == "enable" else f"{C.yellow}已停用{C.reset}"
+            out(f"{mark}: {name}")
+            return 0
+        err(f"插件不存在: {name}")
+        return 1
+
+    err(f"未知操作: {sub}")
+    return 1
 
 
 # ============================================================
@@ -792,6 +813,8 @@ def cmd_stdio(args) -> int:
 
 def cmd_tool_call(args) -> int:
     """以本会话身份直接调用一个工具，绕过 LLM。"""
+    from .plugins import load_all
+    load_all(cfgmod.load())
     name = args.name or ""
     try:
         call_args = json.loads(args.args) if args.args else {}
@@ -895,6 +918,13 @@ q.onkeydown=async e=>{
         out("\n已停止")
     finally:
         srv.server_close()
+    return 0
+
+
+def cmd_bridge(args) -> int:
+    """webhook 桥：前台常驻，供外部聊天软件接入。"""
+    from .bridge import serve
+    serve(args.port or 7800)
     return 0
 
 
@@ -1087,6 +1117,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_daemon)
 
     sp = sub.add_parser("plugins", help="查看已加载插件")
+    sp.add_argument("action", nargs="?", default="list",
+                    choices=["list", "enable", "disable"])
+    sp.add_argument("name", nargs="?")
     sp.set_defaults(func=cmd_plugins)
 
     sp = sub.add_parser("stt", help="语音转文字（需可选依赖）")
@@ -1135,6 +1168,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--host", default="127.0.0.1")
     sp.add_argument("--port", type=int, default=7789)
     sp.set_defaults(func=cmd_web)
+
+    sp = sub.add_parser("bridge", help="webhook 桥（聊天软件接入）")
+    sp.add_argument("--port", type=int, default=7800)
+    sp.set_defaults(func=cmd_bridge)
 
     sp = sub.add_parser("layout", help="数据布局")
     sp.add_argument("--apply", action="store_true")

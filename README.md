@@ -39,6 +39,9 @@ python3 run.py ask "你好"
 | 记忆 | 长期事实存储 + 关键词检索 |
 | 知识库 | 文档导入 + 搜索 |
 | 用量统计 | token 消耗按天汇总 |
+| 插件目录 | 内置 + 用户双层，逐个启停 |
+| 渲染成图 | markdown 表格 / 代码块 → PNG（typst） |
+| 聊天桥 | webhook 常驻服务，接入任意聊天软件 |
 
 ### 工具（13 个内置）
 
@@ -58,6 +61,21 @@ python3 run.py ask "你好"
 | `search_kb` | 搜索知识库 |
 | `system_info` | 系统信息 |
 
+渲染类工具由内置 render 插件提供（需 `sudo pacman -S typst`）：
+
+| 工具 | 作用 |
+|---|---|
+| `render_table` | markdown 表格 → PNG，终端 chafa 预览 |
+| `render_code` | 代码块 → 高亮代码截图 PNG |
+| `render_reply` | 扫描整段文本，批量渲染其中全部表格与代码块 |
+
+聊天桥工具由内置 webhook 插件提供：
+
+| 工具 | 作用 |
+|---|---|
+| `bridge_hint` | 返回接入方法 |
+| `bridge_status` | 探测桥是否在线 |
+
 ### 基础设施
 
 | 模块 | 说明 |
@@ -66,6 +84,7 @@ python3 run.py ask "你好"
 | shell 集成 | fish / bash / zsh 回车拦截，自然语言分流 |
 | 插件系统 | Python 插件 + 脚本工具 |
 | 导入导出 | 配置与人格打包，**不含 API Key** |
+| systemd | bridge / daemon 均可托管为 user service |
 
 ---
 
@@ -182,6 +201,18 @@ noelle history [--limit 20]
 ---
 
 ## 扩展
+
+### 插件目录与启停
+
+```bash
+noelle plugins list              # 列出所有插件与状态
+noelle plugins disable render    # 停用
+noelle plugins enable render     # 启用
+```
+
+内置插件在 `noelle/plugins/builtin_plugins/`，用户插件放
+`~/.noelle/extensions/*.py`。状态存在配置文件
+`"plugins": {"<名>": {"enabled": false}}`。
 
 ### Python 插件
 

@@ -193,3 +193,54 @@ def test_paths_isolated(tmp_home):
     assert str(paths.home()) == tmp_home
     paths.ensure_dirs()
     assert paths.prompts_dir().is_dir()
+
+
+# ---------- plugins ----------
+
+def test_plugin_discover_and_toggle():
+    from noelle.plugins import discover, set_enabled
+    names = [d["name"] for d in discover()]
+    assert "builtin:render" in names
+    assert "builtin:webhook" in names
+    assert set_enabled("render", False)
+    states = {d["name"]: d["enabled"] for d in discover()}
+    assert states["builtin:render"] is False
+    assert set_enabled("render", True)
+    states = {d["name"]: d["enabled"] for d in discover()}
+    assert states["builtin:render"] is True
+
+
+def test_plugin_toggle_unknown():
+    from noelle.plugins import set_enabled
+    assert not set_enabled("no-such-plugin", False)
+
+
+def test_builtin_render_table():
+    from noelle.plugins.builtin_plugins.render import parse_md_table
+    r = parse_md_table("| a | b |\n|---|---|\n| 1 | 2 |")
+    assert r is not None
+    header, aligns, rows = r
+    assert header == ["a", "b"]
+    assert rows == [["1", "2"]]
+    assert parse_md_table("不是表格") is None
+
+
+def test_builtin_render_align():
+    from noelle.plugins.builtin_plugins.render import parse_md_table
+    _, aligns, _ = parse_md_table("| a | b | c |\n|:--|:-:|--:|\n| 1 | 2 | 3 |")
+    assert aligns == ["left", "center", "right"]
+
+
+def test_builtin_render_code_typst():
+    from noelle.plugins.builtin_plugins.render import code_to_typst
+    src = code_to_typst("x=1", "python")
+    assert "```python" in src
+
+
+def test_webhook_tools_registered():
+    from noelle.plugins.builtin_plugins import webhook
+    from noelle.tools import ToolRegistry
+    reg = ToolRegistry()
+    webhook.setup(reg)
+    assert "bridge_hint" in reg.names()
+    assert "bridge_status" in reg.names()

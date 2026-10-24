@@ -88,9 +88,15 @@ class DB:
     def conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "conn", None)
         if c is None:
-            c = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
+            # isolation_level=None: autocommit，任何异常都不会留下
+            # 悬置写事务（多线程 bridge 的"database is locked"根因）
+            c = sqlite3.connect(
+                self.path, timeout=10, check_same_thread=False,
+                isolation_level=None,
+            )
             c.row_factory = sqlite3.Row
             c.execute("PRAGMA foreign_keys=ON")
+            c.execute("PRAGMA busy_timeout=10000")
             self._local.conn = c
         return c
 

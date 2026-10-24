@@ -36,6 +36,8 @@ Event = tuple[str, str]   # (kind, payload)  kind: text/reasoning/tool/tool_resu
 class Agent:
     def __init__(self, cfg: dict | None = None):
         self.cfg = cfg or cfgmod.load()
+        from .plugins import load_all
+        load_all(self.cfg)
 
     # ---------- 模型解析 ----------
     def resolve(self) -> tuple[str, str, str]:
@@ -219,6 +221,18 @@ class Agent:
         stream: bool = True, on_event: Callable[[Event], None] | None = None,
     ) -> Turn:
         db = get_db()
+        row = db.get_session(session_id)
+        if row is None:
+            # bridge / 前端首次接入：自动建档
+            session_id = db.create_session(
+                session_id, mode="bridge",
+                persona=self.cfg.get("prompt", {}).get("active_persona", ""),
+                provider=self.cfg.get("active_provider", ""),
+                model=self.cfg.get("active_model", ""),
+            )
+        else:
+            # 传入的可能是名字，统一换成真实 id
+            session_id = row["id"]
         rows = db.messages(session_id)
         history = [
             {
