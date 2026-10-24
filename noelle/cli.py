@@ -166,17 +166,19 @@ def cmd_ask(args) -> int:
 
     cfg = cfgmod.load()
     a = Agent(cfg)
+    sid = _auto_session(cfg, "ask")
     show_r = cfg.get("display", {}).get("expand_reasoning", False)
     state = {"show_reasoning": show_r}
     try:
-        a.run(text, stream=True, on_event=lambda e: _print_event(e[0], e[1], state))
+        a.chat(sid, text, stream=True,
+               on_event=lambda e: _print_event(e[0], e[1], state))
     except LLMError as e:
         err(str(e))
         return 1
     return 0
 
 
-def cmd_repl(args, mode: str = "normal") -> int:
+def cmd_repl(args, mode: str = "normal", session_name: str | None = None) -> int:
     paths.ensure_dirs()
     cfg = cfgmod.load()
 
@@ -187,7 +189,7 @@ def cmd_repl(args, mode: str = "normal") -> int:
 
     db = get_db()
     # 复用终端会话
-    name = f"terminal-{mode}"
+    name = session_name or f"terminal-{mode}"
     row = db.get_session(name)
     if row is None:
         sid = db.create_session(
@@ -207,7 +209,7 @@ def cmd_repl(args, mode: str = "normal") -> int:
 
     if mode == "normal":
         banner()
-    out(f"{C.dim}{pid}/{model} · /exit 退出 · /help 帮助{C.reset}")
+        out(f"{C.dim}{pid}/{model} · {name} · /exit 退出 · /help 帮助{C.reset}")
     out("")
 
     show_r = cfg.get("display", {}).get("expand_reasoning", False)
@@ -248,6 +250,63 @@ def cmd_repl(args, mode: str = "normal") -> int:
         except LLMError as e:
             err(str(e))
         out("")
+    return 0
+
+
+# ============================================================
+# tapall：列出全部历史对话，可选择继续
+# ============================================================
+def _auto_session(cfg: dict, prefix: str) -> str:
+    """为一次性命令建一个落库会话（tapall 可见可恢复）"""
+    from datetime import datetime
+    db = get_db()
+    stamp = datetime.now().strftime("%m-%d %H:%M")
+    return db.create_session(
+        f"{prefix}-{stamp}", mode="ask",
+        persona=cfg.get("prompt", {}).get("active_persona", ""),
+        provider=cfg.get("active_provider", ""),
+        model=cfg.get("active_model", ""),
+    )
+
+
+def cmd_tapall(args) -> int:
+    db = get_db()
+    rows = db.list_sessions(limit=200)
+    if not rows:
+        out("(还没有任何对话)")
+        return 0
+
+    def _preview(row) -> str:
+        ms = db.messages(row["id"], limit=1)
+        return (ms[-1]["content"].replace("\n", " ")[:48]) if ms else "（空会话）"
+
+    def _ago(ts: float) -> str:
+        d = time.time() - ts
+        if d < 3600:
+            return f"{int(d // 60)} 分钟前"
+        if d < 86400:
+            return f"{int(d // 3600)} 小时前"
+        return f"{int(d // 86400)} 天前"
+
+    # 指定了序号 → 直接恢复该会话进 REPL
+    if args.index:
+        try:
+            row = rows[int(args.index) - 1]
+        except (ValueError, IndexError):
+            err(f"序号超出范围: {args.index}（1-{len(rows)}）")
+            return 1
+        out(f"{C.dim}继续 {C.reset}{row['name']}"
+            f" {C.dim}· {row['msgs']} 条消息 · /exit 退出{C.reset}\n")
+        return cmd_repl(args, mode=row["mode"], session_name=row["name"])
+
+    # 无参数 → 列表
+    body = [
+        [str(i + 1), r["name"], r["mode"], str(r["msgs"]),
+         _ago(r["updated_at"]), _preview(r)]
+        for i, r in enumerate(rows)
+    ]
+    out(table(body, ["#", "会话", "模式", "消息", "最近", "预览"]))
+    out(f"{C.dim}继续某次对话: noelle tapall <序号>{C.reset}")
     return 0
 
 
@@ -1078,6 +1137,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--session")
     sp.add_argument("--limit", type=int, default=20)
     sp.set_defaults(func=cmd_history)
+
+    sp = sub.add_parser("tapall", help="全部历史对话，tapall <序号> 继续")
+    sp.add_argument("index", nargs="?")
+    sp.set_defaults(func=cmd_tapall)
 
     sp = sub.add_parser("reset", help="清空终端会话上下文")
     sp.set_defaults(func=cmd_reset)

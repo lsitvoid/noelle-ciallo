@@ -244,3 +244,33 @@ def test_webhook_tools_registered():
     webhook.setup(reg)
     assert "bridge_hint" in reg.names()
     assert "bridge_status" in reg.names()
+
+
+# ---------- tapall / 会话恢复 ----------
+
+def test_tapall_lists_and_recovers(tmp_home, capsys):
+    from noelle import cli
+    from noelle.storage import get_db
+    db = get_db()
+    sid = db.create_session("测试对话", mode="normal")
+    db.add_message(sid, "user", "你好")
+    db.add_message(sid, "assistant", "你好呀")
+
+    args = cli.build_parser().parse_args(["tapall"])
+    assert cli.cmd_tapall(args) == 0
+    text = capsys.readouterr().out
+    assert "测试对话" in text and "2" in text
+
+    # 序号 1 → 恢复该会话进 REPL（不实际跑 LLM，仅验证路径）
+    args2 = cli.build_parser().parse_args(["tapall", "99"])
+    assert cli.cmd_tapall(args2) == 1
+
+
+def test_auto_session_persists(tmp_home):
+    from noelle import cli
+    from noelle.storage import get_db
+    sid = cli._auto_session({}, "ask")
+    db = get_db()
+    row = db.get_session(sid)
+    assert row is not None and row["name"].startswith("ask-")
+    assert row["mode"] == "ask"

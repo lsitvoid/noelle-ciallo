@@ -111,6 +111,9 @@ noelle session rename <key> --name y
 noelle session clear <key>   # 清空消息
 noelle session pop <key> --count 2
 
+noelle tapall                # 全部历史对话
+noelle tapall 3              # 继续第 3 次对话
+
 noelle kb list               # 知识库
 noelle kb add <文件>
 noelle kb search --query x
