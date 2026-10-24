@@ -86,6 +86,22 @@ python3 run.py ask "你好"
 | 导入导出 | 配置与人格打包，**不含 API Key** |
 | systemd | bridge / daemon 均可托管为 user service |
 
+### 记忆模型（上下文不膨胀）
+
+聊天原文只落 SQLite 备查，**不进上下文**。每轮只注入三类提炼后的
+关键信息（由模型在对话后自动提炼，`memory.auto_distill` 可关）：
+
+| 类别 | 内容 | 注入方式 |
+|---|---|---|
+| `user` | 用户画像：性格、习惯、喜欢 AI 的方式 | 每轮必读 |
+| `self` | AI 画像：性格、被喜欢/被讨厌的样子 | 每轮必读 |
+| `event` | 事件始末 | 按当前输入检索，命中才注入 top-3 |
+
+```bash
+noelle memory list                  # 全部（带类别标签）
+noelle memory list --kind user      # 只看用户画像
+```
+
 ---
 
 ## 命令

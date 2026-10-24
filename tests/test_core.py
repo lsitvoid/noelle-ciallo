@@ -274,3 +274,39 @@ def test_auto_session_persists(tmp_home):
     row = db.get_session(sid)
     assert row is not None and row["name"].startswith("ask-")
     assert row["mode"] == "ask"
+
+
+# ---------- 关键记忆三类 ----------
+
+def test_memory_kinds(tmp_home):
+    from noelle.storage import get_db
+    db = get_db()
+    db.add_memory_typed("喜欢简短回答", "", "user", "auto")
+    db.add_memory_typed("被讨厌时该收敛", "", "self", "auto")
+    db.add_memory_typed("杭州比赛第一名", "", "event", "auto")
+    assert len(db.memories_by_kind("user")) == 1
+    assert len(db.memories_by_kind("self")) == 1
+    assert len(db.memories_by_kind("event")) == 1
+
+
+def test_event_recall(tmp_home):
+    from noelle.agent import Agent
+    from noelle.storage import get_db
+    db = get_db()
+    db.add_memory_typed("上周末杭州比赛拿了第一名的奖杯", "", "event", "auto")
+    a = Agent({"active_provider": "zhipu"})
+    blk = a.recall_block("我那个杭州比赛后来怎么样了")
+    assert "杭州比赛" in blk
+    assert a.recall_block("今天天气如何") == ""
+
+
+def test_profile_block(tmp_home):
+    from noelle.agent import Agent
+    from noelle.storage import get_db
+    db = get_db()
+    db.add_memory_typed("用户叫小明", "", "user", "auto")
+    db.add_memory_typed("回答要简短", "", "self", "auto")
+    a = Agent({})
+    blk = a.profile_block()
+    assert "关于用户" in blk and "小明" in blk
+    assert "关于你自己" in blk and "简短" in blk

@@ -415,12 +415,20 @@ def cmd_memory(args) -> int:
     db = get_db()
     sub = args.action
     if sub == "list" or sub is None:
-        rows = db.list_memories()
+        kind = getattr(args, "kind", None)
+        rows = (db.memories_by_kind(kind, limit=200) if kind
+                else db.list_memories(limit=200))
         if not rows:
             out("(无记忆)")
             return 0
         for r in rows:
-            out(f"{C.dim}[{r['id']}]{C.reset} {r['content']}")
+            keys = r.keys()
+            k = r["kind"] if "kind" in keys else "plain"
+            tag = {"user": C.cyan + "用户" + C.reset,
+                   "self": C.green + "自己" + C.reset,
+                   "event": C.yellow + "事件" + C.reset}.get(
+                k, C.dim + "通用" + C.reset)
+            out(f"{C.dim}[{r['id']}]{C.reset} {tag} {r['content']}")
         return 0
     if sub == "add":
         mid = db.add_memory(" ".join(args.text or []))
@@ -1113,6 +1121,7 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=["list", "add", "search", "delete", "clear"])
     sp.add_argument("text", nargs="*")
     sp.add_argument("--query")
+    sp.add_argument("--kind", choices=["user", "self", "event"])
     sp.add_argument("--key")
     sp.set_defaults(func=cmd_memory)
 

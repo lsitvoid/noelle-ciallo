@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -214,20 +215,82 @@ class DB:
 
     # ---------- 记忆 ----------
     def add_memory(self, content: str, persona: str = "", source: str = "") -> int:
-        cur = self.conn().execute(
-            "INSERT INTO memories(persona,content,source,created_at) VALUES(?,?,?,?)",
-            (persona, content, source, time.time()),
+        return self.add_memory_typed(content, persona, "plain", source)
+
+    def add_memory_typed(
+        self, content: str, persona: str = "",
+        kind: str = "plain", source: str = "",
+    ) -> int:
+        c = self.conn()
+        self._ensure_kind(c)
+        cur = c.execute(
+            "INSERT INTO memories(persona,content,source,created_at,kind)"
+            " VALUES(?,?,?,?,?)",
+            (persona, content, source, time.time(), kind),
         )
-        self.conn().commit()
+        c.commit()
         return int(cur.lastrowid or 0)
+
+    @staticmethod
+    def _ensure_kind(c: sqlite3.Connection) -> None:
+        cols = [r[1] for r in c.execute("PRAGMA table_info(memories)")]
+        if "kind" not in cols:
+            c.execute(
+                "ALTER TABLE memories ADD COLUMN kind TEXT NOT NULL DEFAULT 'plain'"
+            )
+
+    def memories_by_kind(
+        self, kind: str, persona: str = "", limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        c = self.conn()
+        self._ensure_kind(c)
+        sql = "SELECT * FROM memories WHERE kind=?"
+        params: list = [kind]
+        if persona:
+            sql += " AND (persona=? OR persona='')"
+            params.append(persona)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        return c.execute(sql, params).fetchall()
 
     def search_memories(self, query: str, persona: str = "", limit: int = 20) -> list[sqlite3.Row]:
         like = f"%{query}%"
+        self._ensure_kind(self.conn())
         return self.conn().execute(
             "SELECT * FROM memories WHERE content LIKE ? AND (?='' OR persona=?)"
             " ORDER BY id DESC LIMIT ?",
             (like, persona, persona, limit),
         ).fetchall()
+
+    def search_events(self, query: str, persona: str = "", limit: int = 3) -> list[sqlite3.Row]:
+        """事件记忆检索：对话预取用，按词重排取 top-N"""
+        c = self.conn()
+        cols = [r[1] for r in c.execute("PRAGMA table_info(memories)")]
+        if "kind" not in cols:
+            return []
+        # 中文无分词器：标点切块后，长块再切 2-gram
+        chunks = [t for t in re.split(r"[\s，。！？、,.!?:：;；()（）]+", query.strip()) if t]
+        terms: list[str] = []
+        for ch in chunks:
+            if len(ch) <= 3:
+                terms.append(ch)
+            else:
+                terms.extend(ch[i:i + 2] for i in range(len(ch) - 1))
+        terms = sorted(set(terms))
+        if not terms:
+            return []
+        rows = c.execute(
+            "SELECT * FROM memories WHERE kind='event' AND (persona=? OR persona='')"
+            " ORDER BY id DESC LIMIT 200",
+            (persona,),
+        ).fetchall()
+        scored = [
+            (sum(1 for t in terms if t in r["content"]), r)
+            for r in rows
+        ]
+        scored = [x for x in scored if x[0] > 0]
+        scored.sort(key=lambda x: (-x[0], -x[1]["id"]))
+        return [r for _, r in scored[:limit]]
 
     def list_memories(self, persona: str = "", limit: int = 50) -> list[sqlite3.Row]:
         return self.conn().execute(

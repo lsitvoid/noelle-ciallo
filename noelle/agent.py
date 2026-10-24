@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Callable, Iterator
 
@@ -17,6 +18,14 @@ from . import config as cfgmod
 from .llm import LLMClient, LLMError, Message, StreamEvent
 from .storage import get_db
 from .tools import registry as tool_registry
+
+
+def _json_slice(text: str) -> str:
+    """从模型回复中截出首个 JSON 对象"""
+    s, e = text.find("{"), text.rfind("}")
+    if 0 <= s < e:
+        return text[s:e + 1]
+    return text
 
 
 @dataclass
@@ -104,7 +113,105 @@ class Agent:
                 "你可以调用以下工具完成任务：" + names +
                 "。需要时直接调用，不必询问；工具结果返回后继续完成任务。"
             )
+        prof = self.profile_block()
+        if prof:
+            parts.append(prof)
         return "\n\n".join(parts)
+
+    # ---------- 三类必读记忆 ----------
+    #
+    # 不把聊天记录堆进上下文，只读三类提炼后的关键信息：
+    #   user    关于用户：性格、习惯、偏好、喜欢 AI 的方式
+    #   self    关于 noelle 自己：性格、习惯、被喜欢/被讨厌的样子
+    #   event   事件始末：不预注入，按当前输入检索 top-N
+
+    def profile_block(self) -> str:
+        db = get_db()
+        persona = self.cfg.get("prompt", {}).get("active_persona", "")
+        lines: list[str] = ["[必读记忆 · 每轮都生效]"]
+        users = db.memories_by_kind("user", persona, limit=30)
+        if users:
+            lines.append("关于用户：" +
+                         "；".join(r["content"] for r in users))
+        selves = db.memories_by_kind("self", persona, limit=30)
+        if selves:
+            lines.append("关于你自己：" +
+                         "；".join(r["content"] for r in selves))
+        if len(lines) == 1:
+            return ""
+        text = "\n".join(lines)
+        return text[:1500] if len(text) > 1500 else text
+
+    def event_block(self, user_text: str) -> str:
+        """按当前输入检索事件记忆，命中才注入"""
+        db = get_db()
+        persona = self.cfg.get("prompt", {}).get("active_persona", "")
+        rows = db.search_events(user_text, persona, limit=3)
+        if not rows:
+            return ""
+        return "[相关事件回忆]\n" + "\n".join(
+            f"- {r['content']}" for r in rows
+        )
+
+    def distill(self, user_text: str, reply_text: str) -> None:
+        """对话后提炼：只把关键信息写进记忆库（不存聊天原文）。
+
+        三类：
+        - user  用户画像更新（性格/习惯/偏好/喜欢 AI 的方式）
+        - self  自己的画像更新（被喜欢/被讨厌的样子、该改的习惯）
+        - event 有记忆点的事件始末（一句到三句话概括）
+
+        已存在的内容不重复存：先按关键词检索去重。
+        """
+        if not self.cfg.get("memory", {}).get("auto_distill", True):
+            return
+        try:
+            cli = self.client()
+            comp = cli.complete([
+                Message("system",
+                        "你是记忆提炼器。从这轮对话提取值得长期记住的关键信息，"
+                        "输出 JSON（不要多余文字）：\n"
+                        '{"user": ["关于用户的新画像条目"...],'
+                        ' "self": ["关于AI自己(尤其被喜欢/被讨厌的样子)的条目"...],'
+                        ' "events": ["事件始末概括..."]}\n'
+                        "规则：只存稳定、可复用的信息（性格/习惯/偏好/重要事件）；"
+                        "临时闲聊、寒暄不要存；一般性知识问答（问历史/问原理/查资料）"
+                        "全都不存；每条≤40字、必须是这句话独有的信息；"
+                        "没有值得存的类别就留空数组。"),
+                Message("user", f"用户说：{user_text[:500]}\nAI答：{reply_text[:500]}"),
+            ], temperature=0.1)
+            data = json.loads(_json_slice(comp.text))
+        except Exception:  # noqa: BLE001 — 提炼失败不影响主对话
+            return
+
+        db = get_db()
+        persona = self.cfg.get("prompt", {}).get("active_persona", "")
+        for kind, items in (("user", data.get("user", [])),
+                            ("self", data.get("self", [])),
+                            ("event", data.get("events", []))):
+            for it in items:
+                it = str(it).strip()
+                if not it or len(it) > 80:
+                    continue
+                # 去重：同 kind 下完全相同内容跳过
+                dup = db.memories_by_kind(kind, persona, limit=200)
+                if any(it == d["content"] for d in dup):
+                    continue
+                db.add_memory_typed(it, persona, kind, "auto")
+
+    def recall_block(self, user_text: str) -> str:
+        """事件始末：模型提到有印象的东西时自动翻库。
+        事件检索 + 普通记忆检索各取若干。"""
+        ev = self.event_block(user_text)
+        if ev:
+            return ev
+        # 事件没命中，退回普通记忆关键词检索
+        db = get_db()
+        persona = self.cfg.get("prompt", {}).get("active_persona", "")
+        rows = db.search_memories(user_text, persona, limit=2)
+        if not rows:
+            return ""
+        return "[相关记忆]\n" + "\n".join(f"- {r['content']}" for r in rows)
 
     def build_messages(self, history: list[dict], user_text: str) -> list[Message]:
         msgs: list[Message] = []
@@ -135,6 +242,10 @@ class Agent:
         temperature = float(self.cfg.get("temperature", 0.7))
 
         out = Turn()
+
+        recall = self.recall_block(user_text)
+        if recall:
+            messages.append(Message("system", recall))
 
         def emit(kind: str, payload: str) -> None:
             if on_event:
@@ -252,6 +363,11 @@ class Agent:
             tool_calls=turn.tool_calls or None,
             tokens=turn.completion_tokens,
         )
+        # 只提炼关键信息入库，不存原文（上下文不会随历史膨胀）
+        try:
+            self.distill(user_text, turn.text)
+        except Exception:  # noqa: BLE001
+            pass
         if turn.prompt_tokens or turn.completion_tokens:
             pid, model, _ = self.resolve()
             db.record_usage(pid, model, turn.prompt_tokens, turn.completion_tokens)
