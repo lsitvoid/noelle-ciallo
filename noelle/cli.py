@@ -675,7 +675,8 @@ def cmd_shell_classify(args) -> int:
     from .shell import classify
     line = sys.stdin.read() if args.stdin else " ".join(args.text or [])
     print(classify(line))
-    return 0
+    # 退出码对齐 miyu shell-hook 约定：1=自然语言（hook 接管），0=放行
+    return 1 if classify(line) == "natural" else 0
 
 
 def cmd_shell_intercept(args) -> int:
@@ -1466,7 +1467,8 @@ def _handle_shell_protocol(argv: list[str]) -> int:
 
     if mode == "--shell-classify":
         print(verdict)
-        return 0
+        # 退出码对齐 miyu shell-hook 约定：1=自然语言（hook 接管），0=放行
+        return 1 if verdict == "natural" else 0
 
     # --shell-intercept
     if verdict != "natural":
