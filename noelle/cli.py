@@ -938,61 +938,150 @@ def cmd_tool_call(args) -> int:
 
 
 def cmd_web(args) -> int:
-    """极简本地 WebUI。"""
+    """本地 WebUI：SSE 流式 + Markdown 渲染。"""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from .agent import Agent
-    import urllib.parse
 
     host = args.host or "127.0.0.1"
     port = args.port or 7789
-    page = """<!doctype html><meta charset="utf-8">
+    page = r"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>noelle</title>
 <style>
-body{font:15px/1.6 ui-monospace,monospace;max-width:820px;margin:40px auto;padding:0 20px;
-     background:#1a1b26;color:#c0caf5}
-h1{font-size:18px;color:#7aa2f7}
-#log{white-space:pre-wrap;border:1px solid #2f334d;border-radius:8px;padding:16px;
-     height:60vh;overflow:auto;background:#16161e}
-input{width:100%;box-sizing:border-box;padding:10px;margin-top:12px;border-radius:6px;
-      border:1px solid #2f334d;background:#16161e;color:#c0caf5;font:inherit}
-.u{color:#9ece6a}.a{color:#c0caf5}
+:root{--bg:#1a1b26;--bg2:#16161e;--line:#2f334d;--fg:#c0caf5;--dim:#565f89;
+      --green:#9ece6a;--blue:#7aa2f7;--orange:#ff9e64}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
+body{font:15px/1.65 ui-monospace,'Cascadia Code',monospace;background:var(--bg);
+     color:var(--fg);display:flex;flex-direction:column}
+header{padding:14px 22px;border-bottom:1px solid var(--line);display:flex;
+       align-items:baseline;gap:10px;flex:none}
+header b{color:var(--blue);font-size:17px;letter-spacing:.05em}
+header .m{color:var(--dim);font-size:12px}
+#log{flex:1;overflow-y:auto;padding:20px 22px;display:flex;flex-direction:column;
+     gap:14px;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+.msg{max-width:78%;padding:10px 14px;border-radius:12px;white-space:pre-wrap;
+     word-break:break-word}
+.msg.user{align-self:flex-end;background:#24283b;border:1px solid var(--line);
+          border-bottom-right-radius:4px}
+.msg.bot{align-self:flex-start;background:var(--bg2);border:1px solid var(--line);
+         border-bottom-left-radius:4px}
+.msg.bot p{margin:.4em 0}.msg.bot pre{background:#0f0f14;padding:10px 12px;
+    border-radius:6px;overflow-x:auto;margin:.6em 0;font-size:13px}
+.msg.bot code{background:#0f0f14;padding:.1em .4em;border-radius:4px;font-size:.9em}
+.msg.bot pre code{background:none;padding:0}
+.msg.bot h1,.msg.bot h2,.msg.bot h3{margin:.7em 0 .3em;color:var(--blue)}
+.msg.bot ul,.msg.bot ol{margin:.4em 0 .4em 1.4em}
+.msg.bot a{color:var(--blue)}
+.msg.bot table{border-collapse:collapse;margin:.6em 0}
+.msg.bot th,.msg.bot td{border:1px solid var(--line);padding:4px 10px}
+.reasoning{color:var(--dim);font-size:12.5px;border-left:2px solid var(--line);
+           padding-left:10px;margin-bottom:6px;white-space:pre-wrap}
+.cursor::after{content:"▍";color:var(--orange);animation:bl 1s steps(1) infinite}
+@keyframes bl{50%{opacity:0}}
+footer{flex:none;padding:14px 22px 18px;border-top:1px solid var(--line)}
+#row{display:flex;gap:10px;max-width:900px;margin:0 auto}
+textarea{flex:1;resize:none;background:var(--bg2);border:1px solid var(--line);
+    border-radius:10px;color:var(--fg);font:inherit;padding:11px 14px;
+    outline:none;min-height:46px;max-height:160px;transition:border-color .2s}
+textarea:focus{border-color:var(--blue)}
+button{background:var(--blue);color:#16161e;border:none;border-radius:10px;
+    padding:0 22px;font:inherit;font-weight:600;cursor:pointer;transition:opacity .2s}
+button:disabled{opacity:.4;cursor:default}
+.tip{text-align:center;color:var(--dim);font-size:11.5px;margin-top:8px}
+@media (max-width:600px){.msg{max-width:92%}header{padding:12px 16px}
+    #log{padding:16px}footer{padding:12px 16px 14px}}
 </style>
-<h1>noelle</h1>
+<header><b>noelle</b><span class="m" id="meta">·</span></header>
 <div id="log"></div>
-<input id="q" placeholder="输入问题，回车发送…" autofocus>
+<footer><div id="row">
+<textarea id="q" rows="1" placeholder="给 noelle 消息…（Enter 发送 / Shift+Enter 换行）"></textarea>
+<button id="send">发送</button></div>
+<div class="tip">Enter 发送 · Shift+Enter 换行 · 会话自动保存在本机</div></footer>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
 <script>
-const log=document.getElementById('log'),q=document.getElementById('q');
-let sid=localStorage.getItem('sid')||'';
-function add(c,t){const d=document.createElement('div');d.className=c;d.textContent=t;
-  log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
-q.oninput=()=>{};
-q.onkeydown=async e=>{
-  if(e.key!=='Enter'||!q.value.trim())return;
-  const text=q.value.trim();q.value='';
-  add('u','你 › '+text);
-  const out=add('a','noelle › ');
-  const r=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({text,session:sid})});
-  const j=await r.json();
-  sid=j.session||sid;localStorage.setItem('sid',sid);
-  out.textContent='noelle › '+(j.text||j.error||'(空)');
-};
-</script>"""
+const log=document.getElementById('log'),q=document.getElementById('q'),
+      send=document.getElementById('send'),meta=document.getElementById('meta');
+let sid=localStorage.getItem('sid')||'',busy=false;
+function add(cls){const d=document.createElement('div');d.className='msg '+cls;
+  log.appendChild(d);return d;}
+function bottom(){log.scrollTop=log.scrollHeight;}
+function render(el,md){el.innerHTML=marked.parse(md);
+  el.querySelectorAll('pre code').forEach(b=>{});
+  bottom();}
+q.addEventListener('input',()=>{q.style.height='auto';
+  q.style.height=Math.min(q.scrollHeight,160)+'px';});
+async function ask(){
+  const text=q.value.trim();
+  if(!text||busy)return;
+  busy=true;send.disabled=true;q.value='';q.style.height='auto';
+  const u=add('user');u.textContent=text;bottom();
+  const b=add('bot');
+  const think=document.createElement('div');think.className='reasoning';
+  b.appendChild(think);
+  const body=document.createElement('div');body.className='cursor';
+  b.appendChild(body);
+  let acc='',racc='';
+  try{
+    const r=await fetch('/ask',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text,session:sid})});
+    const rd=r.body.getReader(),dec=new TextDecoder();
+    let buf='';
+    for(;;){
+      const {done,value}=await rd.read();if(done)break;
+      buf+=dec.decode(value,{stream:true});
+      const parts=buf.split('\n\n');buf=parts.pop();
+      for(const p of parts){
+        if(!p.startsWith('data: '))continue;
+        const ev=JSON.parse(p.slice(6));
+        if(ev.t==='text'){acc+=ev.d;render(body,acc);}
+        else if(ev.t==='reasoning'){racc+=ev.d;think.textContent=racc;bottom();}
+        else if(ev.t==='error'){body.textContent='⚠ '+ev.d;}
+        else if(ev.t==='end'){
+          sid=ev.session;localStorage.setItem('sid',sid);
+          body.classList.remove('cursor');
+          if(racc)think.textContent='💭 思考 '+racc.length+' 字（点击折叠）';
+          render(body,ev.text||acc);
+          meta.textContent='· '+(ev.meta||'');
+        }
+      }
+    }
+  }catch(e){body.textContent='⚠ 连接失败：'+e;}
+  body.classList.remove('cursor');
+  busy=false;send.disabled=false;q.focus();
+}
+send.onclick=ask;
+q.addEventListener('keydown',e=>{
+  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask();}
+});
+q.focus();
+fetch('/meta').then(r=>r.json()).then(j=>{
+  meta.textContent='· '+(j.desc||'');});
+</script></html>"""
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
-        def do_GET(self):
-            if self.path not in ("/", "/index.html"):
-                self.send_error(404)
-                return
-            body = page.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+        def _send(self, code, ctype, body):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path in ("/", "/index.html"):
+                self._send(200, "text/html; charset=utf-8", page.encode())
+            elif self.path == "/meta":
+                import json as _j
+                cfg = Agent().cfg
+                d = cfg.get("active_provider", "") + "/" + cfg.get("active_model", "")
+                self._send(200, "application/json",
+                           _j.dumps({"desc": d}).encode())
+            else:
+                self.send_error(404)
 
         def do_POST(self):
             if self.path != "/ask":
@@ -1000,22 +1089,36 @@ q.onkeydown=async e=>{
                 return
             n = int(self.headers.get("Content-Length") or 0)
             req = json.loads(self.rfile.read(n) or b"{}")
-            agent = Agent()
             db = get_db()
             sid = req.get("session") or ""
             if not sid or not db.get_session(sid):
                 sid = db.create_session(f"web-{int(time.time())}")
-            try:
-                turn = agent.chat(sid, req.get("text", ""), stream=False)
-                payload = {"text": turn.text, "session": sid}
-            except LLMError as e:
-                payload = {"error": str(e), "session": sid}
-            body = json.dumps(payload, ensure_ascii=False).encode()
+
             self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            self.wfile.write(body)
+
+            def sse(obj):
+                self.wfile.write(
+                    f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+
+            agent = Agent()
+            try:
+                turn = agent.chat(
+                    sid, req.get("text", ""), stream=True,
+                    on_event=lambda ev: sse(
+                        {"t": ev[0], "d": ev[1]})
+                    if ev[0] in ("text", "reasoning", "error") else None,
+                )
+                cfg = agent.cfg
+                meta = cfg.get("active_provider", "") + "/" + cfg.get("active_model", "")
+                sse({"t": "end", "text": turn.text, "session": sid, "meta": meta})
+            except LLMError as e:
+                sse({"t": "end", "text": f"⚠ {e}", "session": sid})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     srv = ThreadingHTTPServer((host, port), H)
     out(f"{C.green}✓{C.reset} WebUI: http://{host}:{port}")

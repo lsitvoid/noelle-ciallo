@@ -33,6 +33,9 @@ function __noelle_accept_line
         $bin --shell-intercept --shell fish -- $line
         commandline -f repaint
         commandline -r ""
+    else if functions -q __miyu_accept_line
+        # 不是给 noelle 的：链式交给 miyu 的回车处理（共存优先级 noelle > miyu > shell）
+        __miyu_accept_line
     else
         commandline -f execute
     end
