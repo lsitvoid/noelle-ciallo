@@ -208,10 +208,12 @@ def cmd_repl(args, mode: str = "normal", session_name: str | None = None) -> int
         pid, model = "未配置", ""
 
     if mode == "normal":
-        banner()
-        out(f"{C.dim}{pid}/{model} · {name} · /exit 退出 · /help 帮助{C.reset}")
-    out("")
+        # 独立终端 UI（miyu 式 REPL）：流式 + Markdown 重渲染 + 斜杠命令
+        from .ui.tui import Tui
+        return Tui(a, db, sid, name).run()
 
+    out(f"{C.dim}{pid}/{model} · {name} · dev REPL · /exit 退出{C.reset}")
+    out("")
     show_r = cfg.get("display", {}).get("expand_reasoning", False)
     while True:
         try:
@@ -939,7 +941,7 @@ def cmd_tool_call(args) -> int:
 
 
 def cmd_web(args) -> int:
-    """本地 WebUI：SSE 流式 + Markdown 渲染。"""
+    """本地 WebUI：LobeChat 风格，SSE 流式 + Markdown + 会话侧栏。"""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from .agent import Agent
 
@@ -949,77 +951,153 @@ def cmd_web(args) -> int:
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>noelle</title>
 <style>
-:root{--bg:#1a1b26;--bg2:#16161e;--line:#2f334d;--fg:#c0caf5;--dim:#565f89;
-      --green:#9ece6a;--blue:#7aa2f7;--orange:#ff9e64}
+:root{--bg:#f9fafb;--panel:#ffffff;--line:#e5e7eb;--fg:#111827;--dim:#6b7280;
+      --acc:#6366f1;--acc2:#8b5cf6;--user-bg:linear-gradient(135deg,#6366f1,#8b5cf6);
+      --bot-bg:#f3f4f6;--code:#1f2937;
+      --dark-bg:#111827;--dark-panel:#1f2937}
+@media (prefers-color-scheme: dark){
+  :root{--bg:#111827;--panel:#1f2937;--line:#374151;--fg:#f3f4f6;--dim:#9ca3af;
+        --bot-bg:#1f2937;--code:#0b1020}}
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%}
-body{font:15px/1.65 ui-monospace,'Cascadia Code',monospace;background:var(--bg);
-     color:var(--fg);display:flex;flex-direction:column}
-header{padding:14px 22px;border-bottom:1px solid var(--line);display:flex;
-       align-items:baseline;gap:10px;flex:none}
-header b{color:var(--blue);font-size:17px;letter-spacing:.05em}
-header .m{color:var(--dim);font-size:12px}
-#log{flex:1;overflow-y:auto;padding:20px 22px;display:flex;flex-direction:column;
-     gap:14px;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
-.msg{max-width:78%;padding:10px 14px;border-radius:12px;white-space:pre-wrap;
-     word-break:break-word}
-.msg.user{align-self:flex-end;background:#24283b;border:1px solid var(--line);
-          border-bottom-right-radius:4px}
-.msg.bot{align-self:flex-start;background:var(--bg2);border:1px solid var(--line);
-         border-bottom-left-radius:4px}
-.msg.bot p{margin:.4em 0}.msg.bot pre{background:#0f0f14;padding:10px 12px;
-    border-radius:6px;overflow-x:auto;margin:.6em 0;font-size:13px}
-.msg.bot code{background:#0f0f14;padding:.1em .4em;border-radius:4px;font-size:.9em}
-.msg.bot pre code{background:none;padding:0}
-.msg.bot h1,.msg.bot h2,.msg.bot h3{margin:.7em 0 .3em;color:var(--blue)}
-.msg.bot ul,.msg.bot ol{margin:.4em 0 .4em 1.4em}
-.msg.bot a{color:var(--blue)}
-.msg.bot table{border-collapse:collapse;margin:.6em 0}
-.msg.bot th,.msg.bot td{border:1px solid var(--line);padding:4px 10px}
-.reasoning{color:var(--dim);font-size:12.5px;border-left:2px solid var(--line);
-           padding-left:10px;margin-bottom:6px;white-space:pre-wrap}
-.cursor::after{content:"▍";color:var(--orange);animation:bl 1s steps(1) infinite}
+body{font:15px/1.7 -apple-system,'Segoe UI','Noto Sans SC',system-ui,sans-serif;
+     background:var(--bg);color:var(--fg);display:flex;overflow:hidden}
+/* ── 侧栏 ── */
+#side{width:248px;flex:none;background:var(--panel);border-right:1px solid var(--line);
+      display:flex;flex-direction:column;transition:margin .25s}
+#side.hide{margin-left:-248px}
+#side h1{font-size:16px;padding:18px 18px 12px;letter-spacing:.04em;
+     background:linear-gradient(90deg,var(--acc),var(--acc2));
+     -webkit-background-clip:text;background-clip:text;color:transparent}
+#newchat{margin:0 14px 10px;padding:9px;border:1px dashed var(--acc);border-radius:10px;
+     background:none;color:var(--acc);cursor:pointer;font:inherit;font-size:13.5px;
+     transition:background .15s}
+#newchat:hover{background:rgba(99,102,241,.08)}
+#sess{flex:1;overflow-y:auto;padding:4px 10px;scrollbar-width:thin}
+.sess-item{padding:9px 12px;border-radius:9px;cursor:pointer;font-size:13.5px;
+     color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+     margin-bottom:2px;transition:background .15s}
+.sess-item:hover{background:rgba(99,102,241,.08)}
+.sess-item.cur{background:rgba(99,102,241,.13);color:var(--acc);font-weight:600}
+#sfoot{padding:12px 16px;border-top:1px solid var(--line);font-size:11.5px;
+     color:var(--dim);flex:none}
+/* ── 主区 ── */
+#main{flex:1;display:flex;flex-direction:column;min-width:0}
+#top{flex:none;display:flex;align-items:center;gap:10px;padding:12px 20px;
+     border-bottom:1px solid var(--line);background:var(--panel)}
+#burger{background:none;border:none;font-size:18px;color:var(--dim);cursor:pointer}
+#model-badge{font-size:12px;color:var(--acc);border:1px solid var(--acc);
+     border-radius:20px;padding:2px 12px}
+#log{flex:1;overflow-y:auto;padding:26px 24px;display:flex;flex-direction:column;
+     gap:18px;scrollbar-width:thin}
+.msg{display:flex;gap:12px;max-width:820px;width:100%;margin:0 auto;
+     animation:fadein .25s ease}
+@keyframes fadein{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.ava{width:34px;height:34px;border-radius:10px;flex:none;display:flex;
+     align-items:center;justify-content:center;font-size:15px;color:#fff;
+     background:var(--user-bg)}
+.msg.bot .ava{background:linear-gradient(135deg,#10b981,#0ea5e9)}
+.bubble{min-width:0;padding:12px 16px;border-radius:14px;line-height:1.75}
+.msg.user .bubble{background:var(--user-bg);color:#fff;border-top-left-radius:4px}
+.msg.bot .bubble{background:var(--bot-bg);border:1px solid var(--line);
+     border-top-right-radius:4px;flex:1}
+.bubble p{margin:.45em 0}.bubble p:first-child{margin-top:0}
+.bubble pre{background:var(--code);color:#e5e7eb;padding:12px 14px;border-radius:10px;
+     overflow-x:auto;margin:.7em 0;font-size:13px}
+.bubble code{font-family:ui-monospace,Consolas,monospace;font-size:.9em;
+     background:rgba(99,102,241,.1);padding:.12em .4em;border-radius:5px}
+.bubble pre code{background:none;padding:0}
+.bubble h1,.bubble h2,.bubble h3{margin:.7em 0 .35em}
+.bubble ul,.bubble ol{margin:.4em 0 .4em 1.4em}
+.bubble a{color:var(--acc)}
+.bubble blockquote{border-left:3px solid var(--acc);padding-left:12px;
+     color:var(--dim);margin:.5em 0}
+.bubble table{border-collapse:collapse;margin:.6em 0}
+.bubble th,.bubble td{border:1px solid var(--line);padding:5px 12px}
+.reasoning{font-size:12.5px;color:var(--dim);background:rgba(99,102,241,.05);
+     border-left:2px solid var(--acc);padding:6px 10px;margin-bottom:8px;
+     border-radius:0 8px 8px 0;white-space:pre-wrap;cursor:pointer}
+.cursor::after{content:"●";color:var(--acc);font-size:10px;
+     animation:bl 1s steps(2) infinite;margin-left:4px}
 @keyframes bl{50%{opacity:0}}
-footer{flex:none;padding:14px 22px 18px;border-top:1px solid var(--line)}
-#row{display:flex;gap:10px;max-width:900px;margin:0 auto}
-textarea{flex:1;resize:none;background:var(--bg2);border:1px solid var(--line);
-    border-radius:10px;color:var(--fg);font:inherit;padding:11px 14px;
-    outline:none;min-height:46px;max-height:160px;transition:border-color .2s}
-textarea:focus{border-color:var(--blue)}
-button{background:var(--blue);color:#16161e;border:none;border-radius:10px;
-    padding:0 22px;font:inherit;font-weight:600;cursor:pointer;transition:opacity .2s}
-button:disabled{opacity:.4;cursor:default}
+/* ── 输入区 ── */
+footer{flex:none;padding:14px 24px 18px;background:var(--panel);
+     border-top:1px solid var(--line)}
+#row{display:flex;gap:10px;max-width:820px;margin:0 auto;align-items:flex-end}
+textarea{flex:1;resize:none;background:var(--bg);border:1px solid var(--line);
+     border-radius:14px;color:var(--fg);font:inherit;padding:12px 16px;outline:none;
+     min-height:48px;max-height:180px;transition:border-color .2s,box-shadow .2s}
+textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(99,102,241,.12)}
+#send{background:var(--user-bg);color:#fff;border:none;border-radius:14px;
+     padding:0 24px;font:inherit;font-weight:600;cursor:pointer;height:48px;
+     transition:opacity .2s,transform .15s}
+#send:hover{transform:translateY(-1px)}
+#send:disabled{opacity:.4;cursor:default;transform:none}
 .tip{text-align:center;color:var(--dim);font-size:11.5px;margin-top:8px}
-@media (max-width:600px){.msg{max-width:92%}header{padding:12px 16px}
-    #log{padding:16px}footer{padding:12px 16px 14px}}
+@media (max-width:768px){#side{position:fixed;z-index:50;height:100%}
+     .msg{max-width:100%}#log{padding:18px 12px}}
 </style>
-<header><b>noelle</b><span class="m" id="meta">·</span></header>
+<header id="top" style="display:flex">
+<button id="burger">☰</button>
+<b style="font-size:15px">noelle</b>
+<span id="model-badge">…</span></header>
+<div id="side"><h1>noelle</h1>
+<button id="newchat">＋ 新会话</button>
+<div id="sess"></div>
+<div id="sfoot">noelle-ciallo · 本地运行</div></div>
 <div id="log"></div>
 <footer><div id="row">
-<textarea id="q" rows="1" placeholder="给 noelle 消息…（Enter 发送 / Shift+Enter 换行）"></textarea>
+<textarea id="q" rows="1" placeholder="给 noelle 发消息…（Enter 发送）"></textarea>
 <button id="send">发送</button></div>
-<div class="tip">Enter 发送 · Shift+Enter 换行 · 会话自动保存在本机</div></footer>
+<div class="tip">Enter 发送 · Shift+Enter 换行</div></footer>
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
 <script>
 const log=document.getElementById('log'),q=document.getElementById('q'),
-      send=document.getElementById('send'),meta=document.getElementById('meta');
+      send=document.getElementById('send'),sessEl=document.getElementById('sess'),
+      badge=document.getElementById('model-badge');
 let sid=localStorage.getItem('sid')||'',busy=false;
-function add(cls){const d=document.createElement('div');d.className='msg '+cls;
-  log.appendChild(d);return d;}
+function add(cls,html){
+  const d=document.createElement('div');d.className='msg '+cls;
+  d.innerHTML='<div class="ava">'+(cls==='user'?'你':'N')+'</div>'+
+              '<div class="bubble">'+(html||'')+'</div>';
+  log.appendChild(d);log.scrollTop=log.scrollHeight;return d.lastElementChild;}
 function bottom(){log.scrollTop=log.scrollHeight;}
-function render(el,md){el.innerHTML=marked.parse(md);
-  el.querySelectorAll('pre code').forEach(b=>{});
-  bottom();}
+function render(el,md){el.innerHTML=marked.parse(md);bottom();}
+async function loadSess(){
+  try{const j=await(await fetch('/sessions')).json();
+    sessEl.innerHTML='';
+    (j.sessions||[]).forEach(s=>{
+      const d=document.createElement('div');
+      d.className='sess-item'+(s.id===sid?' cur':'');
+      d.textContent=s.name||s.id.slice(0,8);
+      d.title=s.name||s.id;
+      d.onclick=()=>{sid=s.id;localStorage.setItem('sid',sid);switchTo(s);};
+      sessEl.appendChild(d);});
+  }catch(e){}}
+async function switchTo(s){
+  log.innerHTML='';
+  try{const j=await(await fetch('/history?session='+encodeURIComponent(s.id))).json();
+    (j.messages||[]).forEach(m=>{
+      if(m.role==='user')add('user','<div class="bubble-in"></div>');
+      const el=add(m.role==='user'?'user':'bot');
+      render(el, m.content||'');});}catch(e){}
+  loadSess();}
+document.getElementById('newchat').onclick=()=>{
+  sid='';localStorage.removeItem('sid');log.innerHTML='';
+  add('bot','新会话已就绪，说点什么吧～');loadSess();};
+document.getElementById('burger').onclick=()=>{
+  document.getElementById('side').classList.toggle('hide');};
 q.addEventListener('input',()=>{q.style.height='auto';
-  q.style.height=Math.min(q.scrollHeight,160)+'px';});
+  q.style.height=Math.min(q.scrollHeight,180)+'px';});
 async function ask(){
   const text=q.value.trim();
   if(!text||busy)return;
   busy=true;send.disabled=true;q.value='';q.style.height='auto';
-  const u=add('user');u.textContent=text;bottom();
+  add('user').innerHTML='<div class="bubble"></div>';
+  log.lastElementChild.querySelector('.bubble').textContent=text;
   const b=add('bot');
   const think=document.createElement('div');think.className='reasoning';
-  b.appendChild(think);
+  think.style.display='none';b.appendChild(think);
   const body=document.createElement('div');body.className='cursor';
   b.appendChild(body);
   let acc='',racc='';
@@ -1035,30 +1113,31 @@ async function ask(){
       const parts=buf.split('\n\n');buf=parts.pop();
       for(const p of parts){
         if(!p.startsWith('data: '))continue;
-        const ev=JSON.parse(p.slice(6));
+        let ev;try{ev=JSON.parse(p.slice(6));}catch(e){continue;}
         if(ev.t==='text'){acc+=ev.d;render(body,acc);}
-        else if(ev.t==='reasoning'){racc+=ev.d;think.textContent=racc;bottom();}
+        else if(ev.t==='reasoning'){racc+=ev.d;think.style.display='block';
+          think.textContent=racc;bottom();}
         else if(ev.t==='error'){body.textContent='⚠ '+ev.d;}
         else if(ev.t==='end'){
           sid=ev.session;localStorage.setItem('sid',sid);
           body.classList.remove('cursor');
-          if(racc)think.textContent='💭 思考 '+racc.length+' 字（点击折叠）';
-          render(body,ev.text||acc);
-          meta.textContent='· '+(ev.meta||'');
+          if(racc){think.textContent='💭 思考过程（点击折叠/展开）';
+            think.onclick=()=>{const open=think.textContent.includes('💭');
+              think.textContent=open?racc:'💭 思考过程（点击折叠/展开）';};}
+          render(body,ev.text||acc);loadSess();
         }
       }
     }
   }catch(e){body.textContent='⚠ 连接失败：'+e;}
   body.classList.remove('cursor');
-  busy=false;send.disabled=false;q.focus();
-}
+  busy=false;send.disabled=false;q.focus();}
 send.onclick=ask;
 q.addEventListener('keydown',e=>{
-  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask();}
-});
+  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask();}});
+fetch('/meta').then(r=>r.json()).then(j=>{badge.textContent=j.desc||'noelle';});
+loadSess();
+if(!sid)add('bot','你好，我是 noelle。说什么都可以～');
 q.focus();
-fetch('/meta').then(r=>r.json()).then(j=>{
-  meta.textContent='· '+(j.desc||'');});
 </script></html>"""
 
     class H(BaseHTTPRequestHandler):
@@ -1076,11 +1155,25 @@ fetch('/meta').then(r=>r.json()).then(j=>{
             if self.path in ("/", "/index.html"):
                 self._send(200, "text/html; charset=utf-8", page.encode())
             elif self.path == "/meta":
-                import json as _j
                 cfg = Agent().cfg
                 d = cfg.get("active_provider", "") + "/" + cfg.get("active_model", "")
                 self._send(200, "application/json",
-                           _j.dumps({"desc": d}).encode())
+                           json.dumps({"desc": d}).encode())
+            elif self.path.startswith("/sessions"):
+                db = get_db()
+                rows = db.list_sessions(limit=60)
+                data = [{"id": r["id"], "name": r["name"]} for r in rows]
+                self._send(200, "application/json",
+                           json.dumps({"sessions": data}, ensure_ascii=False).encode())
+            elif self.path.startswith("/history"):
+                import urllib.parse as _u
+                qs = _u.parse_qs(_u.urlparse(self.path).query)
+                sid = (qs.get("session") or [""])[0]
+                db = get_db()
+                msgs = db.messages(sid) if sid and db.get_session(sid) else []
+                data = [{"role": m["role"], "content": m["content"]} for m in msgs]
+                self._send(200, "application/json",
+                           json.dumps({"messages": data}, ensure_ascii=False).encode())
             else:
                 self.send_error(404)
 
@@ -1109,8 +1202,7 @@ fetch('/meta').then(r=>r.json()).then(j=>{
             try:
                 turn = agent.chat(
                     sid, req.get("text", ""), stream=True,
-                    on_event=lambda ev: sse(
-                        {"t": ev[0], "d": ev[1]})
+                    on_event=lambda ev: sse({"t": ev[0], "d": ev[1]})
                     if ev[0] in ("text", "reasoning", "error") else None,
                 )
                 cfg = agent.cfg
