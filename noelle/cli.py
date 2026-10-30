@@ -526,7 +526,44 @@ def cmd_tools(args) -> int:
     return 0
 
 
+def _find_tui() -> str | None:
+    """定位 noelle-tui 二进制：env → PATH → 仓库内构建产物。"""
+    import shutil as _sh
+    env = os.environ.get("NOELLE_TUI_BIN")
+    if env and Path(env).is_file():
+        return env
+    hit = _sh.which("noelle-tui")
+    if hit:
+        return hit
+    root = Path(__file__).resolve().parent.parent / "tui"
+    for rel in ("target/release/noelle-tui", "target/debug/noelle-tui"):
+        p = root / rel
+        if p.is_file():
+            return str(p)
+    return None
+
+
+def cmd_tui(args) -> int:
+    """可视化设置 TUI（设置 + 插件管理）。"""
+    import shutil
+    import subprocess
+    binp = _find_tui()
+    if not binp:
+        err("未找到 noelle-tui，先编译：cd tui && cargo build --release")
+        return 1
+    env = dict(os.environ)
+    env["NOELLE_BIN"] = shutil.which("noelle") or str(
+        Path(__file__).resolve().parent.parent / "run.py")
+    try:
+        return subprocess.call([binp], env=env)
+    except OSError as e:
+        err(f"启动 TUI 失败: {e}")
+        return 1
+
+
 def cmd_config(args) -> int:
+    if getattr(args, "tui", False):
+        return cmd_tui(args)
     cfg = cfgmod.load()
     if args.key and args.value is not None:
         try:
@@ -758,6 +795,9 @@ def cmd_plugins(args) -> int:
 
     if sub == "list":
         items = discover()
+        if getattr(args, "json", False):
+            out(json.dumps(items, ensure_ascii=False))
+            return 0
         if not items:
             out("(无插件)")
             return 0
@@ -1377,7 +1417,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("config", help="查看或修改配置")
     sp.add_argument("key", nargs="?")
     sp.add_argument("value", nargs="?")
+    sp.add_argument("--tui", action="store_true", help="打开可视化设置 TUI")
     sp.set_defaults(func=cmd_config)
+
+    sp = sub.add_parser("tui", help="可视化设置 TUI（Rust/ratatui）：设置 + 插件")
+    sp.set_defaults(func=cmd_tui)
 
     sp = sub.add_parser("history", help="查看历史")
     sp.add_argument("--session")
@@ -1434,6 +1478,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("action", nargs="?", default="list",
                     choices=["list", "enable", "disable"])
     sp.add_argument("name", nargs="?")
+    sp.add_argument("--json", action="store_true", help="机器可读输出（TUI 用）")
     sp.set_defaults(func=cmd_plugins)
 
     sp = sub.add_parser("stt", help="语音转文字（需可选依赖）")

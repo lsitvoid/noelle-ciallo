@@ -17,3 +17,6 @@ config.jsonc
 .idea/
 *.swp
 .DS_Store
+
+# Rust TUI 构建产物
+tui/target/

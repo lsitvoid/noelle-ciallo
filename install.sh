@@ -49,6 +49,18 @@ else
     info "配置已存在，保留"
 fi
 
+# ---------- 3.5 Rust 可视化 TUI（可选） ----------
+if command -v cargo >/dev/null 2>&1 && [ -f tui/Cargo.toml ]; then
+    if (cd tui && cargo build --release -q 2>/dev/null); then
+        install -m 755 tui/target/release/noelle-tui "$BIN_DIR/noelle-tui"
+        info "已安装 noelle-tui（noelle tui 启动）"
+    else
+        warn "noelle-tui 编译失败，跳过（不影响主程序）"
+    fi
+else
+    warn "未检测到 cargo，跳过 Rust TUI（之后可 cd tui && cargo build --release）"
+fi
+
 # ---------- 4. shell 集成（可选） ----------
 if [ "${1:-}" = "--shell" ] && command -v fish >/dev/null 2>&1; then
     "$TARGET" fish-init >/dev/null && info "fish hook 已安装"
@@ -68,6 +80,7 @@ cat <<'MSG'
    路径信息：  noelle paths
 
    数据目录：  ~/.noelle
+   可视化设置：noelle tui            # Rust TUI：设置 + 插件
    终端集成：  noelle fish-init     # fish
                noelle bash-init     # bash
                noelle zsh-init      # zsh
